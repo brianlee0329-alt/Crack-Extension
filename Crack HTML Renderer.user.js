@@ -2,7 +2,7 @@
 // @name         Crack HTML Renderer
 // @namespace    http://tampermonkey.net/
 // @version      1.0.0
-// @description  Crack(crack.wrtn.ai) 채팅 메시지 내 HTML 코드를 감지, 직접 DOM에 렌더링합니다. v1.0.7: 목록(ul, ol)의 기호가 details 상자 밖으로 잘리는 현상 수정
+// @description  Crack(crack.wrtn.ai) 채팅 메시지 내 HTML 코드를 감지, 직접 DOM에 렌더링합니다.
 // @author       -
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
