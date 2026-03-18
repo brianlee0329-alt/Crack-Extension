@@ -34,6 +34,6 @@ TXT 추출 및 불러오기 지원
 
 # 크랙 HTML 렌더링 지원(Crack HTML Renderer)
 ## 기본 기능
-크랙 플랫폼 환경에서 details, summary, div, aside, article, p, ul, li, ol, strong, br, b, i, em 문법을 지원하는 확장 프로그램
+크랙 플랫폼 환경에서 details, summary, div, aside, article, style, p, ul, li, ol, strong, br, b, i, em 문법을 지원하는 확장 프로그램
 
 ※ 주의: 이 확장 프로그램은 제작자의 역량을 넘어선 프로그램입니다. 의도하지 않은 문법이 지원되거나, 지원되는 문법이 깨질 수 있습니다.
