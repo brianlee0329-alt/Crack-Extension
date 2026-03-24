@@ -65,3 +65,5 @@ audio, img, span(span class="s" 형태), ruby, sub, sup 등의 문법을 추가 
 
 ## V1.5.2
 이전 버전에서 확인된 문제 해결
+
+※ 확인된 문제: HTML 렌더링으로 생성된 이미지가 로드되지 않는 문제
