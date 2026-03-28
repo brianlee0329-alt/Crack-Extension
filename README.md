@@ -34,6 +34,8 @@ TXT 추출 및 불러오기 지원
 
 버튼 통합
 
+※ 업데이트 종료: 추후 이것을 기반으로 다른 확장 프로그램이 생성될 수는 있으나 짭차원이동의 기능적 업데이트는 완전 종료
+
 # 크랙 HTML 렌더링 지원(Crack HTML Renderer)
 ## 기본 기능
 크랙 플랫폼 환경에서 details, summary, div, aside, article, style, p, ul, li, ol, strong, br, b, i, em 문법을 지원하는 확장 프로그램
