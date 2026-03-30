@@ -161,7 +161,7 @@
         overlay.innerHTML = `
             <div id="lf-modal" onclick="event.stopPropagation()">
                 <h3>
-                    <span>⚙️ 통합 폴더 관리 v4.0</span>
+                    <span>⚙️ 통합 폴더 관리 v2.0.0</span>
                     <span style="font-size:11px; font-weight:normal; opacity:0.6;">(클릭 시 즉시 이동)</span>
                 </h3>
 
