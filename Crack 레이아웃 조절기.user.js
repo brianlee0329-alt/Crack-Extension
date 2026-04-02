@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Crack 레이아웃 조절기
 // @namespace    https://github.com/local/crack-layout
-// @version      1.5.4
+// @version      1.5.5
 // @description  채팅창 너비 조절 + 컴팩트 모드
 // @author       Tyme
 // @match        https://crack.wrtn.ai/stories/*
@@ -79,6 +79,17 @@
                 max-width: 25px !important;
                 width: revert !important;
                 height: revert !important;
+            }
+            /* ── 원형 아바타 보호 (Tailwind w-6 h-6 클래스 기반 크기) ──
+               플랫폼이 아바타 크기를 HTML attribute → Tailwind 클래스로 전환하면서
+               전역 width/height:auto 규칙이 w-6 h-6 을 덮어쓰는 문제 해소.
+               rounded-full 은 아바타/아이콘 전용 클래스이므로 안전하게 고정 가능.
+            ─────────────────────────────────────────────────────────────────── */
+            div.max-w-\\[768px\\] img.rounded-full {
+                max-height: none !important;
+                max-width: none !important;
+                width: 1.5rem !important;
+                height: 1.5rem !important;
             }
 
             /* ── 컴팩트 모드: 그룹 BFC float ────────────────────────────────────
