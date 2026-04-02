@@ -16,7 +16,7 @@
     // ─────────────────────────────────────────────
     const STORAGE_KEY = 'liked_folders_v1';
 
-    // v2.1.0 패치: 플랫폼 HTML 구조 변경 대응
+    // v2.0.1 패치: 플랫폼 HTML 구조 변경 대응
     // Emotion 해시 클래스 → Tailwind 클래스 기반으로 전환됨
     const GRID_SEL   = '#liked-scroll div[class*="grid-cols-3"]';  // 작품 그리드 컨테이너
     const CARD_SEL   = ':scope > div[role="button"]';               // 개별 카드 (직접 자식만)
