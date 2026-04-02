@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         좋아요 목록 관리
 // @namespace    https://github.com/workforomg/Util
-// @version      2.0.0
+// @version      2.0.1
 // @description  좋아요 목록 검색/폴더 기능 지원
 // @match        https://crack.wrtn.ai/liked*
 // @grant        GM_addStyle
@@ -15,6 +15,12 @@
     // 0. 상수 및 설정
     // ─────────────────────────────────────────────
     const STORAGE_KEY = 'liked_folders_v1';
+
+    // v2.1.0 패치: 플랫폼 HTML 구조 변경 대응
+    // Emotion 해시 클래스 → Tailwind 클래스 기반으로 전환됨
+    const GRID_SEL   = '#liked-scroll div[class*="grid-cols-3"]';  // 작품 그리드 컨테이너
+    const CARD_SEL   = ':scope > div[role="button"]';               // 개별 카드 (직접 자식만)
+    const TITLE_SEL  = 'p.line-clamp-2';                           // 작품 제목 텍스트
 
     const PATH_UNSAFE = "m20.7 4.47-8.3-2.68c-.26-.08-.54-.08-.8 0L3.3 4.47c-.54.18-.9.68-.9 1.24v4.12c0 5.74 3.69 10.81 9.18 12.61.13.05.28.07.42.07s.28-.02.42-.07c5.49-1.8 9.18-6.87 9.18-12.61V5.71c0-.56-.36-1.06-.9-1.24M12 6.28c1.83 0 3.31 1.48 3.31 3.31S13.83 12.9 12 12.9s-3.31-1.49-3.31-3.31S10.17 6.28 12 6.28m4.35 12a9 9 0 0 1-.58.51c-.03.03-.07.06-.11.08-.06.06-.13.12-.2.16-.06.06-.13.11-.2.15 0 .01-.01.01-.02.02l-.1.07c-.94.69-2 1.23-3.14 1.62-1.66-.55-3.12-1.45-4.34-2.61a9.3 9.3 0 0 1-1.09-1.17c1.42-1.34 3.67-1.83 5.41-1.83s4.02.49 5.44 1.83c-.32.41-.68.81-1.07 1.17";
 
@@ -31,7 +37,7 @@
         localStorage.setItem(STORAGE_KEY, JSON.stringify(folders));
     }
     function getCardKey(card) {
-        return card.querySelector('.css-5zg2vu')?.textContent?.trim() || '';
+        return card.querySelector(TITLE_SEL)?.textContent?.trim() || '';
     }
 
     // ─────────────────────────────────────────────
@@ -152,8 +158,8 @@
         let folders = getFolders();
         let currentFolderId = folders.length > 0 ? folders[0].id : null;
 
-        const grid = document.querySelector('.css-1kwvgm4');
-        const allCards = Array.from(grid?.querySelectorAll('.css-543uqt') || []).filter(c => !c.closest('.lf-folder-card'));
+        const grid = document.querySelector(GRID_SEL);
+        const allCards = Array.from(grid?.querySelectorAll(CARD_SEL) || []).filter(c => !c.closest('.lf-folder-card'));
         const allKeys = allCards.map(c => getCardKey(c)).filter(k => k);
 
         const overlay = document.createElement('div');
@@ -161,7 +167,7 @@
         overlay.innerHTML = `
             <div id="lf-modal" onclick="event.stopPropagation()">
                 <h3>
-                    <span>⚙️ 통합 폴더 관리 v2.0.0</span>
+                    <span>⚙️ 통합 폴더 관리 v2.1.0</span>
                     <span style="font-size:11px; font-weight:normal; opacity:0.6;">(클릭 시 즉시 이동)</span>
                 </h3>
 
@@ -317,7 +323,6 @@
             renameBlock.style.display = 'flex';
         };
 
-        // 핵심 변경 부분: 이름/상위 폴더 적용 버튼
         document.getElementById('lf-btn-rename-confirm').onclick = () => {
             const folderIndex = folders.findIndex(f => f.id === currentFolderId);
             if (folderIndex === -1) return;
@@ -325,26 +330,18 @@
             const folder = folders[folderIndex];
             const newParentId = parentSelect.value || null;
 
-            // 1. 이름 업데이트
             folder.name = document.getElementById('lf-rename-input').value.trim() || folder.name;
 
-            // 2. 부모 폴더가 변경되었는지 확인
             if (folder.parentId !== newParentId) {
                 folder.parentId = newParentId;
 
-                // 새로운 부모 폴더가 설정되었다면 배열 순서 재정렬
                 if (newParentId) {
-                    // 현재 폴더를 배열에서 잠시 빼냅니다.
                     const [movedFolder] = folders.splice(folderIndex, 1);
-
-                    // 새로운 부모 폴더가 배열의 어디에 있는지 찾습니다.
                     const parentIndex = folders.findIndex(f => f.id === newParentId);
 
-                    // 부모 폴더 바로 뒤(parentIndex + 1)에 다시 끼워 넣습니다.
                     if (parentIndex !== -1) {
                         folders.splice(parentIndex + 1, 0, movedFolder);
                     } else {
-                        // 예기치 못한 에러로 부모를 못 찾으면 맨 뒤에 넣습니다.
                         folders.push(movedFolder);
                     }
                 }
@@ -353,7 +350,7 @@
             saveFolders(folders);
             renderAll();
             renameBlock.style.display = 'none';
-            renderModalUI(); // UI를 다시 그리면 변경된 배열 순서대로 모달 드롭다운이 갱신됩니다.
+            renderModalUI();
         };
 
         document.getElementById('lf-btn-rename-cancel').onclick = () => renameBlock.style.display = 'none';
@@ -419,7 +416,7 @@
     }
 
     function renderAll() {
-        const grid = document.querySelector('.css-1kwvgm4');
+        const grid = document.querySelector(GRID_SEL);
         if (!grid) return;
 
         const folders = getFolders();
@@ -429,7 +426,7 @@
         grid.querySelectorAll('#lf-scroll-spacer').forEach(el => el.remove());
         grid.style.paddingBottom = '0px';
 
-        const allCards = Array.from(grid.querySelectorAll('.css-543uqt')).filter(c => !c.closest('.lf-folder-card'));
+        const allCards = Array.from(grid.querySelectorAll(CARD_SEL)).filter(c => !c.closest('.lf-folder-card'));
 
         allCards.forEach(card => {
             if (assignedKeys.has(getCardKey(card))) {
@@ -489,16 +486,16 @@
     }
 
     function applySearch(query) {
-        const grid = document.querySelector('.css-1kwvgm4');
+        const grid = document.querySelector(GRID_SEL);
         if (!grid) return;
         const assignedKeys = new Set(getFolders().flatMap(f => f.items));
 
-        grid.querySelectorAll('.css-543uqt').forEach(card => {
+        grid.querySelectorAll(CARD_SEL).forEach(card => {
             if (card.closest('.lf-folder-card')) return;
             const key = getCardKey(card);
             if (assignedKeys.has(key)) return;
             if (!query) { card.style.display = ''; return; }
-            const titleText = card.querySelector('.css-5zg2vu')?.textContent.toLowerCase() || '';
+            const titleText = card.querySelector(TITLE_SEL)?.textContent.toLowerCase() || '';
             card.style.display = titleText.includes(query) ? '' : 'none';
         });
 
@@ -567,11 +564,11 @@
             stickyWrap.remove();
         }
 
-        const grid = document.querySelector('.css-1kwvgm4');
+        const grid = document.querySelector(GRID_SEL);
         if (grid) {
             grid.querySelectorAll('.lf-folder-card').forEach(el => el.remove());
             grid.querySelector('#lf-scroll-spacer')?.remove();
-            grid.querySelectorAll('.css-543uqt').forEach(card => card.style.display = '');
+            grid.querySelectorAll(CARD_SEL).forEach(card => card.style.display = '');
         }
 
         lastCardCount = 0;
@@ -591,10 +588,10 @@
 
         initUI();
 
-        const grid = document.querySelector('.css-1kwvgm4');
+        const grid = document.querySelector(GRID_SEL);
         if (!grid) return;
 
-        const cards = Array.from(grid.querySelectorAll('.css-543uqt'))
+        const cards = Array.from(grid.querySelectorAll(CARD_SEL))
             .filter(c => !c.closest('.lf-folder-card'));
 
         const savedFolderCount = getFolders().length;
