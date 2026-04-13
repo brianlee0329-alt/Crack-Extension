@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         채팅 세션 관리
 // @namespace    https://github.com/workforomg/Utill
-// @version      2.0.0
-// @description  유저 편집 폴더, 채팅방 검색(메모 포함), 세션별 메모 삽입
+// @version      2.1.0
+// @description  유저 편집 폴더, 채팅방 검색(메모 포함), 세션별 메모 삽입, 이어하기 세션 선택
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
 // @run-at       document-end
@@ -568,13 +568,157 @@
     }
 
     // =================================================================
-    // 11. 실행
+    // 11. 이어하기 세션 선택
+    // =================================================================
+
+    /**
+     * storyId에 해당하는 사이드바 세션 목록 반환
+     * @param {string} storyId
+     * @returns {{ href: string, name: string }[]}
+     */
+    function getSessionsForStory(storyId) {
+        const root = getSidebarRoot();
+        const results = [];
+        const seen = new Set();
+        const selector = `a[href*="/stories/${storyId}/episodes/"]`;
+        // 사이드바 + 전체 DOM 탐색 (폴더 안에 숨겨진 세션 포함)
+        const containers = [root, document.body];
+        for (const c of containers) {
+            if (!c) continue;
+            c.querySelectorAll(selector).forEach(a => {
+                const h = a.getAttribute('href');
+                if (!h || seen.has(h)) return;
+                seen.add(h);
+                results.push({ href: h, name: extractTitle(a) });
+            });
+        }
+        return results;
+    }
+
+    /**
+     * 세션 선택 모달 열기
+     * @param {{ href: string, name: string }[]} sessions
+     * @param {string} fallbackHref  세션이 0개일 때 이동할 원본 href
+     */
+    function openSessionPickerModal(sessions, fallbackHref) {
+        document.getElementById('crack-session-picker-modal')?.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'crack-session-picker-modal';
+
+        const listHTML = sessions.map((s, i) => {
+            const memo = getMemo(s.href);
+            const memoTxt = memo ? `<span class="csp-memo">📝 ${memo.length > 30 ? memo.substring(0, 30) + '…' : memo}</span>` : '';
+            return `
+                <a class="csp-item" href="${s.href}" data-idx="${i}">
+                    <span class="csp-name">${s.name}</span>
+                    ${memoTxt}
+                </a>`;
+        }).join('');
+
+        modal.innerHTML = `
+            <div class="csp-box">
+                <div class="csp-header">
+                    <span class="csp-icon">▶</span>
+                    <span class="csp-title">이어할 세션을 선택하세요</span>
+                    <span class="csp-count">${sessions.length}개</span>
+                </div>
+                <div class="csp-list">${listHTML}</div>
+                <div class="csp-footer">
+                    <button class="csp-btn" id="csp-cancel">취소</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        modal.querySelectorAll('.csp-item').forEach(a => {
+            a.addEventListener('click', e => {
+                e.preventDefault();
+                modal.remove();
+                window.location.href = a.getAttribute('href');
+            });
+        });
+        modal.querySelector('#csp-cancel').onclick = () => modal.remove();
+        modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+
+        const onKey = e => {
+            if (e.key === 'Escape') { modal.remove(); document.removeEventListener('keydown', onKey); }
+        };
+        document.addEventListener('keydown', onKey);
+    }
+
+    /**
+     * "이어하기" 텍스트를 가진 버튼/링크를 찾아 클릭 이벤트 인터셉트
+     * storyId 추출 우선순위:
+     *   1) 요소 자신의 href
+     *   2) 가장 가까운 ancestor의 href/data-story
+     *   3) 현재 페이지 URL
+     */
+    function interceptContinueButtons() {
+        // 이미 처리된 요소는 건너뜀
+        const candidates = document.querySelectorAll(
+            'a:not([data-csp-intercepted]), button:not([data-csp-intercepted])'
+        );
+        candidates.forEach(el => {
+            const text = (el.innerText || el.textContent || '').trim();
+            if (text !== '이어하기') return;
+
+            el.setAttribute('data-csp-intercepted', '1');
+
+            el.addEventListener('click', e => {
+                // storyId 추출
+                let storyId = null;
+
+                // 1) 자신의 href
+                const selfHref = el.getAttribute('href') || '';
+                let m = selfHref.match(/\/stories\/([^/?#]+)/);
+                if (m) storyId = m[1];
+
+                // 2) ancestor href/data-story-id
+                if (!storyId) {
+                    let node = el.parentElement;
+                    while (node && node !== document.body) {
+                        const aHref = node.getAttribute?.('href') || '';
+                        m = aHref.match(/\/stories\/([^/?#]+)/);
+                        if (m) { storyId = m[1]; break; }
+                        const ds = node.dataset?.storyId || node.dataset?.story;
+                        if (ds) { storyId = ds; break; }
+                        node = node.parentElement;
+                    }
+                }
+
+                // 3) 현재 URL
+                if (!storyId) {
+                    m = window.location.pathname.match(/\/stories\/([^/?#]+)/);
+                    if (m) storyId = m[1];
+                }
+                // detail 페이지 패턴: /detail/{storyId}
+                if (!storyId) {
+                    m = window.location.pathname.match(/\/detail\/([^/?#]+)/);
+                    if (m) storyId = m[1];
+                }
+
+                if (!storyId) return; // storyId 없으면 기본 동작 유지
+
+                const sessions = getSessionsForStory(storyId);
+                if (sessions.length <= 1) return; // 1개 이하: 기본 동작
+
+                e.preventDefault();
+                e.stopPropagation();
+                openSessionPickerModal(sessions, selfHref);
+            }, true /* capture */);
+        });
+    }
+
+    // =================================================================
+    // 12. 실행
     // =================================================================
     setInterval(() => {
         injectManagerButton();
         injectSearchBar();
         injectMemoUI();
         renderSidebarFolders();
+        interceptContinueButtons();
     }, 3000);
 
     let _debounce = null;
@@ -588,11 +732,12 @@
             injectSearchBar();
             injectMemoUI();
             renderSidebarFolders();
+            interceptContinueButtons();
         }, 400);
     }).observe(document.body, { childList: true, subtree: true });
 
     // =================================================================
-    // 12. 스타일
+    // 13. 스타일
     // =================================================================
     GM_addStyle(`
         /* 검색 숨김 */
@@ -811,5 +956,70 @@
             .fset-btn                 { background: #3a3a3a; color: #eee; border-color: #555; }
             .fset-btn:hover           { background: #484848; }
         }
+        /* ── 이어하기 세션 선택 모달 ── */
+        #crack-session-picker-modal {
+            position: fixed; inset: 0; background: rgba(0,0,0,.6);
+            display: flex; align-items: center; justify-content: center;
+            z-index: 99999;
+        }
+        .csp-box {
+            background: var(--surface_secondary, #1e1e1e);
+            color: var(--text_primary, #eee);
+            border-radius: 14px; padding: 0;
+            width: 440px; max-width: 93vw; max-height: 72vh;
+            display: flex; flex-direction: column;
+            box-shadow: 0 16px 48px rgba(0,0,0,.7);
+            border: 1px solid rgba(255,255,255,.08);
+            overflow: hidden;
+        }
+        .csp-header {
+            display: flex; align-items: center; gap: 8px;
+            padding: 16px 18px 14px;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+            font-size: 14px; font-weight: 700;
+            flex-shrink: 0;
+        }
+        .csp-icon  { font-size: 13px; color: #FF4432; flex-shrink: 0; }
+        .csp-title { flex: 1; }
+        .csp-count {
+            font-size: 11px; font-weight: normal;
+            opacity: .5; flex-shrink: 0;
+        }
+        .csp-list {
+            flex: 1; overflow-y: auto;
+            padding: 6px 0;
+        }
+        .csp-item {
+            display: flex; flex-direction: column; gap: 3px;
+            padding: 11px 18px;
+            text-decoration: none; color: inherit;
+            cursor: pointer;
+            transition: background .12s;
+            border-bottom: 1px solid rgba(255,255,255,.04);
+        }
+        .csp-item:last-child { border-bottom: none; }
+        .csp-item:hover { background: rgba(150,150,150,.07); }
+        .csp-name {
+            font-size: 13px; font-weight: 500;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .csp-memo {
+            font-size: 11px; color: var(--text_tertiary, #888);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .csp-footer {
+            display: flex; justify-content: flex-end;
+            padding: 12px 18px;
+            border-top: 1px solid rgba(255,255,255,.08);
+            flex-shrink: 0;
+        }
+        .csp-btn {
+            padding: 7px 18px; border-radius: 7px;
+            border: 1px solid rgba(255,255,255,.15);
+            background: rgba(255,255,255,.06); color: inherit;
+            font-size: 13px; cursor: pointer;
+            transition: background .15s;
+        }
+        .csp-btn:hover { background: rgba(255,255,255,.12); }
     `);
 })();
