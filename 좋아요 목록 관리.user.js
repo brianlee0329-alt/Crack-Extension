@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         좋아요 목록 관리
 // @namespace    https://github.com/workforomg/Util
-// @version      2.0.1
+// @version      2.0.2
 // @description  좋아요 목록 검색/폴더 기능 지원
 // @match        https://crack.wrtn.ai/liked*
 // @grant        GM_addStyle
@@ -16,7 +16,7 @@
     // ─────────────────────────────────────────────
     const STORAGE_KEY = 'liked_folders_v1';
 
-    // v2.0.1 패치: 플랫폼 HTML 구조 변경 대응
+    // v2.1.0 패치: 플랫폼 HTML 구조 변경 대응
     // Emotion 해시 클래스 → Tailwind 클래스 기반으로 전환됨
     const GRID_SEL   = '#liked-scroll div[class*="grid-cols-3"]';  // 작품 그리드 컨테이너
     const CARD_SEL   = ':scope > div[role="button"]';               // 개별 카드 (직접 자식만)
@@ -490,6 +490,7 @@
         if (!grid) return;
         const assignedKeys = new Set(getFolders().flatMap(f => f.items));
 
+        // 미분류 카드 처리 (폴더 밖 카드)
         grid.querySelectorAll(CARD_SEL).forEach(card => {
             if (card.closest('.lf-folder-card')) return;
             const key = getCardKey(card);
@@ -499,12 +500,56 @@
             card.style.display = titleText.includes(query) ? '' : 'none';
         });
 
-        grid.querySelectorAll('.lf-folder-card').forEach(folderBlock => {
-            if (query) {
-                folderBlock.style.display = ''; folderBlock.classList.add('expanded');
+        // 폴더 카드 재귀 처리: 매칭 여부(boolean)를 반환
+        function processFolderBlock(folderBlock) {
+            const innerGrid = folderBlock.querySelector('.lf-folder-grid');
+
+            if (!query) {
+                // 검색어 없음: 모든 폴더 초기 상태로 복원
+                folderBlock.style.display = '';
+                folderBlock.classList.remove('expanded');
+                if (innerGrid) {
+                    innerGrid.querySelectorAll(':scope > [role="button"]').forEach(c => c.style.display = '');
+                    innerGrid.querySelectorAll(':scope > .lf-folder-card').forEach(sub => processFolderBlock(sub));
+                }
+                return true;
+            }
+
+            if (!innerGrid) {
+                folderBlock.style.display = 'none';
+                return false;
+            }
+
+            let hasMatch = false;
+
+            // 직속 아이템 카드 필터링
+            innerGrid.querySelectorAll(':scope > [role="button"]').forEach(card => {
+                const titleText = card.querySelector(TITLE_SEL)?.textContent.toLowerCase() || '';
+                const matched = titleText.includes(query);
+                card.style.display = matched ? '' : 'none';
+                if (matched) hasMatch = true;
+            });
+
+            // 하위 폴더 재귀 처리
+            innerGrid.querySelectorAll(':scope > .lf-folder-card').forEach(sub => {
+                if (processFolderBlock(sub)) hasMatch = true;
+            });
+
+            // 매칭 항목이 있으면 펼침, 없으면 숨김
+            if (hasMatch) {
+                folderBlock.style.display = '';
+                folderBlock.classList.add('expanded');
             } else {
+                folderBlock.style.display = 'none';
                 folderBlock.classList.remove('expanded');
             }
+
+            return hasMatch;
+        }
+
+        // 최상위 폴더만 순회 (하위 폴더는 재귀 내부에서 처리)
+        grid.querySelectorAll(':scope > .lf-folder-card').forEach(folderBlock => {
+            processFolderBlock(folderBlock);
         });
     }
 
