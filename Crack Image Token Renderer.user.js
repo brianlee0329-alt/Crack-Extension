@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Crack Image Token Renderer
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  {{분류::상황}} 토큰 및 igx.kr URL을 이미지로 변환합니다.
+// @version      1.0.1
+// @description  {{분류::상황}} 및 {{img::분류::상황}} 토큰과 igx.kr URL을 이미지로 변환합니다.
 // @author       -
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
@@ -45,7 +45,7 @@
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch (_) {}
   }
 
-  let settings = loadSettings();
+  let 설정 = loadSettings();
 
   // ============================================================
   //  스타일
@@ -127,27 +127,27 @@
       <div class="crk-itr-field">
         <span class="crk-itr-label">URL 템플릿</span>
         <span class="crk-itr-hint">{cat} = 분류, {sit} = 상황</span>
-        <input type="text" id="crk-itr-url" value="${safe(settings.urlTemplate)}" />
+        <input type="text" id="crk-itr-url" value="${safe(설정.urlTemplate)}" />
       </div>
 
       <div class="crk-itr-field">
         <span class="crk-itr-label">이미지 최대 너비 (CSS)</span>
-        <input type="text" id="crk-itr-width" value="${safe(settings.maxWidth)}" />
+        <input type="text" id="crk-itr-width" value="${safe(설정.maxWidth)}" />
       </div>
 
       <div class="crk-itr-field">
         <span class="crk-itr-label">로드 실패 시</span>
         <div class="crk-itr-radio-group">
-          <label><input type="radio" name="crk-itr-onerr" value="token" ${settings.onError==='token'?'checked':''}> 원문 복원</label>
-          <label><input type="radio" name="crk-itr-onerr" value="hide"  ${settings.onError==='hide' ?'checked':''}> 숨김</label>
+          <label><input type="radio" name="crk-itr-onerr" value="token" ${설정.onError==='token'?'checked':''}> 원문 복원</label>
+          <label><input type="radio" name="crk-itr-onerr" value="hide"  ${설정.onError==='hide' ?'checked':''}> 숨김</label>
         </div>
       </div>
 
       <div class="crk-itr-field">
-        <span class="crk-itr-label">스캔 주기: <span id="crk-itr-poll-val">${settings.pollMs}</span>ms</span>
+        <span class="crk-itr-label">스캔 주기: <span id="crk-itr-poll-val">${설정.pollMs}</span>ms</span>
         <span class="crk-itr-hint">낮을수록 빠르게 반응하지만 CPU 사용량 증가. 기본 500ms.</span>
         <div class="crk-itr-poll-row">
-          <input type="range" id="crk-itr-poll" min="200" max="2000" step="100" value="${settings.pollMs}">
+          <input type="range" id="crk-itr-poll" min="200" max="2000" step="100" value="${설정.pollMs}">
         </div>
       </div>
 
@@ -172,8 +172,8 @@
       const newErr   = modal.querySelector('input[name="crk-itr-onerr"]:checked')?.value ?? 'token';
       const newPoll  = parseInt(pollSlider.value, 10) || 500;
       if (newUrl) {
-        settings = { urlTemplate: newUrl, maxWidth: newWidth || '100%', onError: newErr, pollMs: newPoll };
-        saveSettings(settings);
+        설정 = { urlTemplate: newUrl, maxWidth: newWidth || '100%', onError: newErr, pollMs: newPoll };
+        saveSettings(설정);
         restartPoller();
       }
       overlay.remove();
@@ -201,10 +201,10 @@
   setTimeout(injectButton, 600);
 
   // ============================================================
-  //  정규식
+  //  정규식 (수정됨)
   // ============================================================
-  // 그룹 [1][2] → {{cat::sit}}, 그룹 [3] → igx.kr URL, 그룹 [4] → 확장자 기반 URL
-  const COMBINED_RE = /\{\{([^:{}\s]+)::([^:{}\s}]+)\}\}|(https?:\/\/igx\.kr\/[^\s<>"')\]]+)|(https?:\/\/[^\s<>"')\]]+\.(?:png|jpe?g|gif|webp|avif|svg)(?:[?#][^\s<>"')\]]*)?)/gi;
+  // 그룹 [1][2] → {{cat::sit}} 또는 {{img::cat::sit}}, 그룹 [3] → igx.kr URL, 그룹 [4] → 확장자 기반 URL
+  const COMBINED_RE = /\{\{(?:img::)?([^:{}\s]+)::([^:{}\s}]+)\}\}|(https?:\/\/igx\.kr\/[^\s<>"')\]]+)|(https?:\/\/[^\s<>"')\]]+\.(?:png|jpe?g|gif|webp|avif|svg)(?:[?#][^\s<>"')\]]*)?)/gi;
 
   function hasMatch(text) {
     COMBINED_RE.lastIndex = 0;
@@ -214,7 +214,7 @@
   }
 
   function buildUrl(cat, sit) {
-    return settings.urlTemplate
+    return 설정.urlTemplate
       .replace('{cat}', encodeURIComponent(cat))
       .replace('{sit}', encodeURIComponent(sit));
   }
@@ -224,13 +224,13 @@
     img.src                = src;
     img.alt                = fallbackText;
     img.title              = fallbackText;
-    img.style.maxWidth     = settings.maxWidth;
+    img.style.maxWidth     = 설정.maxWidth;
     img.style.borderRadius = '8px';
     img.style.display      = 'inline-block';
     img.style.verticalAlign = 'middle';
 
     img.addEventListener('error', () => {
-      if (settings.onError === 'token') {
+      if (설정.onError === 'token') {
         const span = document.createElement('span');
         span.setAttribute(FB_ATTR, '1');   // 폴링이 이 span을 재변환하지 않도록 마킹
         span.textContent      = fallbackText;
@@ -295,8 +295,8 @@
         // FB_ATTR 마킹된 span 내부는 재처리 금지 (무한 루프 방지)
         if (node.parentElement?.hasAttribute?.(FB_ATTR)) return NodeFilter.FILTER_SKIP;
 
-        const tag = node.parentElement?.tagName?.toLowerCase();
-        if (SKIP_TAG.has(tag)) return NodeFilter.FILTER_REJECT;
+        const 꼬리표 = node.parentElement?.tagName?.toLowerCase();
+        if (SKIP_TAG.has(꼬리표)) return NodeFilter.FILTER_REJECT;
 
         return hasMatch(node.textContent)
           ? NodeFilter.FILTER_ACCEPT
@@ -317,7 +317,7 @@
 
   function restartPoller() {
     if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(scanAll, settings.pollMs);
+    pollTimer = setInterval(scanAll, 설정.pollMs);
   }
 
   restartPoller();
