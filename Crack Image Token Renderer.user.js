@@ -2,7 +2,7 @@
 // @name         Crack Image Token Renderer
 // @namespace    http://tampermonkey.net/
 // @version      1.0.1
-// @description  {{분류::상황}} 및 {{img::분류::상황}} 토큰과 igx.kr URL을 이미지로 변환합니다.
+// @description  {{분류::상황}} 및 {{img::분류::상황}} 토큰을 이미지로 변환합니다.
 // @author       -
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
