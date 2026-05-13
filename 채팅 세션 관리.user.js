@@ -1,621 +1,721 @@
 // ==UserScript==
 // @name         채팅 세션 관리
 // @namespace    https://github.com/workforomg/Utill
-// @version      2.1.0
-// @description  유저 편집 폴더, 채팅방 검색(메모 포함), 세션별 메모 삽입, 이어하기 세션 선택
+// @version      3.0.0
+// @description  보관함/채팅 목록 탭 분리 + 검색/메모/이어하기/이름 애니메이션 통합
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
 // @run-at       document-end
 // ==/UserScript==
 
-(function() {
+(function () {
     'use strict';
 
-    const FOLDER_KEY = 'my_custom_chat_folders_v1';
-    const MEMO_KEY   = 'crack_session_memos_v1';
+    /* ================================================================
+       상수 / 셀렉터
+    ================================================================ */
+    const MEMO_KEY  = 'crack_session_memos_v1';
+    const CACHE_KEY = 'crack_session_cache_v1';
+    const HIER_KEY  = 'crack_archive_parent_v1'; // {자식이름: 부모이름}
+    const ANAME_KEY = 'crack_archive_names_v1';  // 보관함 이름 캐시 (string[])
 
-    const expandedFolders = new Set();
-    let _isRendering  = false;
-    let _lastRenderSig = ''; // 폴더 데이터 서명 — 변경이 없으면 렌더 생략
+    const SEL_LINK     = 'a[href*="/stories/"][href*="/episodes/"]';
+    const SEL_NAME     = 'span.typo-text-sm_leading-none_medium';
+    const SEL_MORE_BTN = 'button[aria-label="채팅방 메뉴"]';
+    const SEL_VSCROLL  = '[data-testid="virtuoso-scroller"]';
+    const SEL_VLIST    = '[data-testid="virtuoso-item-list"]';
 
-    // =================================================================
-    // 0. 사이드바 루트
-    // =================================================================
-    function getSidebarRoot() {
-        const c = document.querySelector('.css-kvsjdq');
-        if (c) return c;
-        for (const el of document.querySelectorAll('p, span, div')) {
-            if (el.innerText && el.innerText.trim() === '채팅 내역') {
-                const h = el.closest('div');
-                if (h && h.nextElementSibling) return h.nextElementSibling;
-            }
+    /* ================================================================
+       0. 데이터 레이어
+    ================================================================ */
+
+    // ── 세션 캐시 ───────────────────────────────────────────────────
+    function getCache()               { try { return JSON.parse(localStorage.getItem(CACHE_KEY)) || {}; } catch { return {}; } }
+    function cacheSession(href, title) {
+        if (!href || !title) return;
+        const c = getCache();
+        if (!c[href] || c[href].title !== title) {
+            c[href] = { title, ts: Date.지금() };
+            localStorage.setItem(CACHE_KEY, JSON.stringify(c));
+        }
+    }
+
+    // ── 메모 ────────────────────────────────────────────────────────
+    function getMemo(href) { try { return (JSON.parse(localStorage.getItem(MEMO_KEY)) || {})[href] || ''; } catch { return ''; } }
+    function saveMemo(href, txt) {
+        try {
+            const m = JSON.parse(localStorage.getItem(MEMO_KEY)) || {};
+            if (txt.trim()) m[href] = txt.trim(); else delete m[href];
+            localStorage.setItem(MEMO_KEY, JSON.stringify(m));
+        } catch {}
+    }
+
+    // ── 보관함 계층 ─────────────────────────────────────────────────
+    function getHierarchy()              { try { return JSON.parse(localStorage.getItem(HIER_KEY)) || {}; } catch { return {}; } }
+    function saveHierarchy(h)            { localStorage.setItem(HIER_KEY, JSON.stringify(h)); }
+    function getArchiveParent(name)      { return getHierarchy()[name] || null; }
+    function setArchiveParent(name, par) {
+        const h = getHierarchy();
+        if (par) h[name] = par; else delete h[name];
+        saveHierarchy(h);
+    }
+    function getArchiveChildren(par) {
+        return Object.entries(getHierarchy()).filter(([, v]) => v === par).map(([k]) => k);
+    }
+    // DOM에서 현재 보이는 보관함 이름 수집 (이동 모달용)
+    function collectVisibleArchiveNames() {
+        return [...document.querySelectorAll(`${SEL_VLIST} ${SEL_NAME}`)]
+            .map(s => s.textContent.trim()).filter(Boolean);
+    }
+    // 보관함 이름 캐시 — archive-list/edit 뷰의 보관함 버튼에서만 수집
+    function getArchiveNames()  { try { return JSON.parse(localStorage.getItem(ANAME_KEY)) || []; } catch { return []; } }
+    function cacheArchiveNames() {
+        // 보관함 버튼(button.flex.items-center.gap-2)의 이름만 수집 (채팅 세션 a 태그 제외)
+        const fresh = [...document.querySelectorAll(`${SEL_VLIST} div[data-index] button.flex.items-center ${SEL_NAME}`)]
+            .map(s => s.textContent.trim()).filter(Boolean);
+        if (!fresh.length) return;
+        // 계층에 이미 등록된 이름(숨겨진 하위 보관함)도 포함하여 유지
+        const h = getHierarchy();
+        const fromHier = [...new Set([...Object.keys(h), ...Object.values(h)])];
+        // 현재 보이는 것 + 계층 데이터 합산; 이전 캐시는 사용 안 함 (이름 변경 대응)
+        const merged = [...new Set([...fresh, ...fromHier])];
+        localStorage.setItem(ANAME_KEY, JSON.stringify(merged));
+    }
+
+    /* ================================================================
+       1. 뷰 감지 (5종)
+    ================================================================ */
+    function detectView() {
+        // 편집 종료 버튼이 있으면 편집 모드 (가장 먼저 체크)
+        if (document.querySelector('button[aria-label="편집 종료"]')) return 'archive-edit';
+        // 보관함 전체보기 버튼이 있으면 메인 뷰
+        if (document.querySelector('button[aria-label="보관함 전체보기"]')) return 'main';
+        // 뒤로가기가 없으면 메인 (fallback)
+        const backBtn = document.querySelector('button[aria-label="뒤로가기"]');
+        if (!backBtn) return 'main';
+        // 헤더 타이틀로 전체 보관함 / 개별 보관함 구분
+        const titleSpan = document.querySelector('div.shrink-0.flex.items-center.gap-2.h-12 span.flex-1');
+        return (titleSpan?.textContent?.trim() === '보관함') ? 'archive-list' : 'archive-inner';
+    }
+
+    /* ================================================================
+       2. 유틸
+    ================================================================ */
+    function extractTitle(a) {
+        const n = a.querySelector(SEL_NAME);
+        if (n?.innerText.trim()) return n.innerText.trim();
+        const img = a.querySelector('img[alt]');
+        if (img?.alt.trim()) return img.alt.trim();
+        return (a.innerText || '').split('\n')[0].trim() || '이름 없는 세션';
+    }
+
+    const delay = ms => new Promise(r => setTimeout(r, ms));
+
+    async function waitForEl(sel, timeout = 2000) {
+        const end = Date.지금() + timeout;
+        while (Date.지금() < end) {
+            const el = document.querySelector(sel);
+            if (el) return el;
+            await delay(80);
         }
         return null;
     }
 
-    // =================================================================
-    // 1. 폴더 데이터
-    // =================================================================
-    function getFolders() {
-        try {
-            return (JSON.parse(localStorage.getItem(FOLDER_KEY)) || []).map(f => ({
-                id: f.id, name: f.name,
-                parentId: f.parentId || null,
-                sessions: f.sessions || f.items || []
-            }));
-        } catch { return []; }
-    }
-    function saveFolders(folders) {
-        localStorage.setItem(FOLDER_KEY, JSON.stringify(folders));
-        _lastRenderSig = ''; // 저장 후 반드시 재렌더
-    }
-    function foldersSig(folders) {
-        return folders.map(f => f.id + ':' + (f.parentId || '') + ':' + f.sessions.join(','))
-                      .join('|');
+    /* ================================================================
+       2-b. Virtuoso 스크롤러 높이 보정
+            검색창·자식 패널이 scroller 앞에 삽입되면
+            Virtuoso의 inline "height:100%" 와 합산되어 넘침.
+            CSS !important 로 calc(100% - Npx) 를 강제 적용.
+            (CSS specificity: 동적 stylesheet !important > 인라인 style)
+    ================================================================ */
+    function _getDynStyle() {
+        let s = document.getElementById('crack-dyn-style');
+        if (!s) {
+            s = document.createElement('style');
+            s.id = 'crack-dyn-style';
+            document.head.appendChild(s);
+        }
+        return s;
     }
 
-    // =================================================================
-    // 2. 메모 데이터
-    // =================================================================
-    function getMemos()             { try { return JSON.parse(localStorage.getItem(MEMO_KEY)) || {}; } catch { return {}; } }
-    function getMemo(href)          { return getMemos()[href] || ''; }
-    function saveMemo(href, text)   {
-        const m = getMemos();
-        if (text.trim() === '') delete m[href]; else m[href] = text.trim();
-        localStorage.setItem(MEMO_KEY, JSON.stringify(m));
+    function adjustScrollerHeight() {
+        const scroller = document.querySelector(SEL_VSCROLL);
+        if (!scroller) { _getDynStyle().textContent = ''; return; }
+
+        let offset = 0;
+        const search = document.getElementById('crack-search-container');
+        const child  = document.getElementById('crack-child-archives');
+        if (search) offset += search.getBoundingClientRect().height;
+        if (child)  offset += child.getBoundingClientRect().height;
+
+        _getDynStyle().textContent = offset > 0
+            ? `[data-testid="virtuoso-scroller"]{height:calc(100% - ${Math.ceil(offset)}px)!important;}`
+            : '';
     }
 
-    // =================================================================
-    // 3. 세션 제목 추출
-    // =================================================================
-    function extractTitle(a) {
-        const n = a.querySelector('.chat-list-item-character-name');
-        if (n && n.innerText.trim()) return n.innerText.trim();
-        const img = a.querySelector('img[alt]');
-        if (img && img.alt.trim()) return img.alt.trim();
-        return (a.innerText || '').split('\n')[0].trim() || '이름 없는 세션';
+    /* ================================================================
+       3. 메인 뷰: 보관함 섹션 숨김
+          data-attribute 방식: CSS가 선택자로 직접 제어하므로
+          React 재조정(reconciliation)으로 inline style이 초기화돼도 유지됨
+    ================================================================ */
+    function hideNativeArchiveSection() {
+        const trigger = document.querySelector('button[aria-label="보관함 전체보기"]');
+        if (!trigger) return;
+
+        // trigger → 조상 중 class="relative"인 div 탐색
+        let rel = trigger.parentElement;
+        while (rel && rel !== document.body) {
+            if (rel.tagName === 'DIV' && rel.classList.contains('relative')) break;
+            rel = rel.parentElement;
+        }
+        if (!rel || rel === document.body) return;
+
+        // data attribute 마킹 (GM_addStyle의 CSS가 이 attribute로 숨김 처리)
+        rel.setAttribute('data-crack-arch-section', '1');
+        const divider = rel.nextElementSibling;
+        if (divider) divider.setAttribute('data-crack-arch-divider', '1');
+        const chatHdr = divider?.nextElementSibling;
+        if (chatHdr) chatHdr.setAttribute('data-crack-chat-hdr', '1');
     }
 
-    // =================================================================
-    // 4. 메모 UI 주입 (setInterval 대신 renderSidebarFolders 후 호출)
-    // =================================================================
+    /* ================================================================
+       4. 보관함 / 채팅 목록 탭 (main + archive-list 양 뷰에서 유지)
+    ================================================================ */
+    function injectViewTabs() {
+        if (document.getElementById('crack-view-tabs')) return;
+
+        const view = detectView();
+        // archive-inner / archive-edit 에서는 탭 불필요
+        if (view !== 'main' && view !== 'archive-list') return;
+
+        // 삽입 위치: virtuoso 컨테이너(pl-2 div) 바로 앞
+        // 메인 뷰:          div.flex-1.min-h-0.overflow-hidden.pl-2          (min-w-0 없음)
+        // archive-list 뷰:  div.flex-1.min-w-0.min-h-0.overflow-hidden.pl-2  (min-w-0 있음)
+        const inner = document.querySelector('div.flex-1.min-w-0.min-h-0.overflow-hidden.pl-2')
+                   || document.querySelector('div.flex-1.min-h-0.overflow-hidden.pl-2');
+        if (!inner || !inner.parentElement) return;
+
+        const isArchive = (view === 'archive-list');
+
+        const tabs = document.createElement('div');
+        tabs.id = 'crack-view-tabs';
+        tabs.innerHTML = `
+            <button class="crack-tab-btn ${isArchive ? 'crack-tab-active' : ''}" data-tab="archive">보관함</button>
+            <button class="crack-tab-btn ${!isArchive ? 'crack-tab-active' : ''}" data-tab="chatlist">채팅 목록</button>`;
+
+        // 보관함 탭 클릭
+        tabs.querySelector('[data-tab="archive"]').addEventListener('click', () => {
+            const v = detectView();
+            if (v === 'main') {
+                // 메인 → 보관함 전체 뷰
+                document.querySelector('button[aria-label="보관함 전체보기"]')?.click();
+            }
+            // archive-list에서는 이미 보관함 뷰이므로 아무것도 하지 않음
+        });
+
+        // 채팅 목록 탭 클릭
+        tabs.querySelector('[data-tab="chatlist"]').addEventListener('click', () => {
+            const v = detectView();
+            if (v === 'archive-list') {
+                // 보관함 전체 → 메인 뷰 (뒤로가기)
+                document.querySelector('button[aria-label="뒤로가기"]')?.click();
+            }
+            // main에서는 이미 채팅 목록 뷰이므로 아무것도 하지 않음
+        });
+
+        inner.parentElement.insertBefore(tabs, inner);
+    }
+
+    /* ================================================================
+       5. 검색창 (main 제외, 공통)
+    ================================================================ */
+    function injectSearchBar() {
+        if (document.getElementById('crack-search-container')) return;
+        const scroller = document.querySelector(SEL_VSCROLL);
+        if (!scroller?.parentElement) return;
+        const wrap = document.createElement('div');
+        wrap.id = 'crack-search-container';
+        wrap.innerHTML = `
+            <div id="crack-search-inner">
+                <span class="crack-search-icon">🔍</span>
+                <input type="text" id="crack-search-input" placeholder="검색...">
+            </div>`;
+        scroller.parentElement.insertBefore(wrap, scroller);
+        document.getElementById('crack-search-input').addEventListener('input', e => filterSessions(e.target.value));
+        // 삽입 후 레이아웃이 확정되면 높이 보정
+        requestAnimationFrame(adjustScrollerHeight);
+    }
+
+    function filterSessions(raw) {
+        const kw   = raw.toLowerCase().replace(/\s+/g, '');
+        const view = detectView();
+
+        document.querySelectorAll(`${SEL_VLIST} div[data-index]`).forEach(wrapper => {
+            // 보관함 계층으로 이미 숨긴 아이템은 건드리지 않음
+            if (wrapper.dataset.crackHierHide === '1') return;
+
+            let text = '';
+            if (view === 'archive-list' || view === 'archive-edit') {
+                text = (wrapper.querySelector(SEL_NAME)?.textContent || '').trim().toLowerCase().replace(/\s+/g, '');
+                wrapper.style.display = (!kw || text.includes(kw)) ? '' : 'none';
+            } else {
+                const a = wrapper.querySelector(SEL_LINK);
+                if (!a) return;
+                text = extractTitle(a).toLowerCase().replace(/\s+/g, '');
+                const memo = getMemo(a.getAttribute('href') || '').toLowerCase().replace(/\s+/g, '');
+                wrapper.style.display = (!kw || text.includes(kw) || memo.includes(kw)) ? '' : 'none';
+            }
+        });
+    }
+
+    /* ================================================================
+       6. 보관함 계층: 전체/편집 뷰에서 자식 보관함 숨김
+    ================================================================ */
+    function applyArchiveHierarchy() {
+        const h = getHierarchy();
+        const childSet = new Set(Object.keys(h));
+        if (!childSet.size) return;
+
+        document.querySelectorAll(`${SEL_VLIST} div[data-index]`).forEach(wrapper => {
+            const name = wrapper.querySelector(SEL_NAME)?.textContent.trim();
+            if (!name) return;
+            if (childSet.has(name)) {
+                wrapper.style.setProperty('display', 'none', 'important');
+                wrapper.dataset.crackHierHide = '1';
+            } else {
+                wrapper.style.removeProperty('display');
+                delete wrapper.dataset.crackHierHide;
+            }
+        });
+    }
+
+    /* ================================================================
+       7. 편집 뷰: 이동 버튼 주입
+    ================================================================ */
+    function injectMoveButtons() {
+        document.querySelectorAll(`${SEL_VLIST} div[data-index]:not([data-crack-move])`).forEach(wrapper => {
+            wrapper.dataset.crackMove = '1';
+            const absDiv  = wrapper.querySelector('.absolute.top-3.right-3');
+            const nameSpan = wrapper.querySelector(SEL_NAME);
+            const archiveName = nameSpan?.textContent.trim();
+            if (!archiveName || !absDiv) return;
+            if (absDiv.querySelector('.crack-move-btn')) return;
+
+            const btn = document.createElement('button');
+            btn.className = 'crack-move-btn';
+            btn.title = '다른 보관함으로 이동';
+            btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M19 3H5a2 2 0 0 0-2 2v4h2V5h14v14H5v-4H3v4a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zM3 13h8.586l-2.293 2.293 1.414 1.414L15.414 12l-4.707-4.707-1.414 1.414L11.586 11H3v2z"/></svg>`;
+            btn.addEventListener('click', e => {
+                e.stopPropagation();
+                openMoveModal(archiveName);
+            });
+            absDiv.insertBefore(btn, absDiv.firstChild);
+        });
+    }
+
+    function openMoveModal(archiveName) {
+        document.getElementById('crack-move-modal')?.remove();
+        const allNames    = collectVisibleArchiveNames().filter(n => n !== archiveName);
+        const curParent   = getArchiveParent(archiveName);
+
+        const modal = document.createElement('div');
+        modal.id = 'crack-move-modal';
+        modal.innerHTML = `
+            <div class="cmove-box">
+                <div class="cmove-header">
+                    <span>↗ 이동</span>
+                    <span class="cmove-target">"${archiveName}"</span>
+                </div>
+                <div class="cmove-list">
+                    <div class="cmove-item ${!curParent ? 'cmove-active' : ''}" data-name="">
+                        🏠 최상위 (이동 해제)
+                    </div>
+                    ${allNames.map(n => `
+                        <div class="cmove-item ${curParent === n ? 'cmove-active' : ''}" data-name="${n}">
+                            📂 ${n}
+                        </div>`).join('')}
+                </div>
+                <div class="cmove-footer">
+                    <button id="cmove-cancel" class="cmove-btn">취소</button>
+                </div>
+            </div>`;
+        document.body.appendChild(modal);
+
+        modal.querySelectorAll('.cmove-item').forEach(item => {
+            item.addEventListener('click', () => {
+                const par = item.dataset.name || null;
+                setArchiveParent(archiveName, par);
+                modal.remove();
+                applyArchiveHierarchy();
+            });
+        });
+        modal.querySelector('#cmove-cancel').onclick = () => modal.remove();
+        modal.onclick = e => { if (e.target === modal) modal.remove(); };
+        const onKey = e => { if (e.key === 'Escape') { modal.remove(); document.removeEventListener('keydown', onKey); } };
+        document.addEventListener('keydown', onKey);
+    }
+
+    /* ================================================================
+       8. 개별 보관함 내부: 자식 보관함 패널
+    ================================================================ */
+    function injectChildArchivesPanel() {
+        const titleSpan = document.querySelector('div.shrink-0.flex.items-center.gap-2.h-12 span.flex-1');
+        const curName   = titleSpan?.textContent.trim();
+        if (!curName) return;
+
+        const children = getArchiveChildren(curName);
+        let panel = document.getElementById('crack-child-archives');
+
+        if (!children.length) {
+            panel?.remove();
+            return;
+        }
+
+        const scroller = document.querySelector(SEL_VSCROLL);
+        if (!scroller?.parentElement) return;
+
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.id = 'crack-child-archives';
+            scroller.parentElement.insertBefore(panel, scroller);
+        }
+
+        // 자식 목록 업데이트
+        const sig = children.join(',');
+        if (panel.dataset.sig === sig) return;
+        panel.dataset.sig = sig;
+
+        panel.innerHTML = `
+            <div class="cca-header">하위 보관함</div>
+            ${children.map(name => `
+                <button class="cca-item" data-target="${name}">
+                    <div class="cca-thumb">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" width="26" height="26">
+                            <path fill-rule="evenodd" d="M2 6a2 2 0 0 1 2-2h4.586A2 2 0 0 1 10 4.586L11.414 6H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z" clip-rule="evenodd"/>
+                        </svg>
+                    </div>
+                    <div class="cca-info">
+                        <span class="cca-name">${name}</span>
+                    </div>
+                </button>
+            `).join('')}`;
+
+        panel.querySelectorAll('.cca-item').forEach(btn => {
+            const targetName = btn.dataset.target;
+            btn.addEventListener('click', async () => {
+                // 뒤로가기 → 전체 보관함 뷰 → 숨겨진 해당 보관함 버튼 클릭
+                const backBtn = document.querySelector('button[aria-label="뒤로가기"]');
+                if (!backBtn) return;
+                backBtn.click();
+                await delay(400);
+                // 전체 보관함 뷰에서 해당 이름의 아이템 찾기 (숨김 해제 후 클릭)
+                const items = document.querySelectorAll(`${SEL_VLIST} div[data-index]`);
+                for (const wrapper of items) {
+                    const span = wrapper.querySelector(SEL_NAME);
+                    if (span?.textContent.trim() !== targetName) continue;
+                    wrapper.style.removeProperty('display');
+                    delete wrapper.dataset.crackHierHide;
+                    wrapper.querySelector('button.flex.items-center.gap-2')
+                        ?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    return;
+                }
+                alert(`"${targetName}" 보관함을 찾을 수 없습니다.\n스크롤을 내려 목록을 로드 후 다시 시도해 주세요.`);
+            });
+        });
+        requestAnimationFrame(adjustScrollerHeight);
+    }
+
+    /* ================================================================
+       9. 개별 보관함 내부: 하위 보관함 관리 버튼 + 모달
+    ================================================================ */
+    function injectCreateArchiveBtn() {
+        const hdr = document.querySelector('div.shrink-0.flex.items-center.gap-2.h-12.px-2');
+        if (!hdr || hdr.querySelector('#crack-create-arch-btn')) return;
+
+        const titleSpan = hdr.querySelector('span.flex-1');
+        const curName   = titleSpan?.textContent.trim();
+        if (!curName) return;
+
+        const btn = document.createElement('button');
+        btn.id        = 'crack-create-arch-btn';
+        btn.className = 'crack-icon-action-btn';
+        btn.title     = '하위 보관함 관리';
+        btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" width="18" height="18">
+            <path d="M18.9 17.32h3.07v1.6H18.9v3.06h-1.6v-3.06h-3.06v-1.6h3.07v-3.07h1.6z"/>
+            <path fill-rule="evenodd" d="M20.7 4c.7 0 1.25.56 1.25 1.25v4.6c0 .6-.43 1.09-.99 1.2V13h-1.6v-1.9H4.61v6.69h7.37v1.6H4.24a1.23 1.23 0 0 1-1.23-1.23v-7.1a1.2 1.2 0 0 1-.98-1.2v-4.6c0-.7.55-1.25 1.24-1.25zM3.62 9.5h16.73V5.6H3.62z" clip-rule="evenodd"/>
+            <path d="M14.98 13.2v1.6h-6v-1.6z"/></svg>`;
+        btn.addEventListener('click', () => openSubArchiveModal(curName));
+
+        const menuBtn = hdr.querySelector('button[aria-label="보관함 메뉴"]');
+        if (menuBtn) hdr.insertBefore(btn, menuBtn);
+        else hdr.appendChild(btn);
+    }
+
+    /* ================================================================
+       9-b. 하위 보관함 뒤로가기 인터셉트
+            부모 보관함이 지정된 경우: 뒤로가기 → 전체 보관함 → 부모 클릭
+    ================================================================ */
+    function injectBackIntercept() {
+        const titleSpan = document.querySelector('div.shrink-0.flex.items-center.gap-2.h-12 span.flex-1');
+        const curName   = titleSpan?.textContent.trim();
+        if (!curName) return;
+
+        const parentName = getArchiveParent(curName);
+        if (!parentName) return; // 부모 없으면 인터셉트 불필요
+
+        const backBtn = document.querySelector('button[aria-label="뒤로가기"]');
+        if (!backBtn || backBtn.dataset.crackBackIntercepted) return;
+        backBtn.dataset.crackBackIntercepted = '1';
+
+        backBtn.addEventListener('click', async () => {
+            // 플랫폼이 전체 보관함으로 이동한 뒤 상위 보관함을 찾아 클릭
+            const end = Date.지금() + 2500;
+            while (Date.지금() < end) {
+                await delay(120);
+                if (detectView() !== 'archive-list') continue;
+                const items = document.querySelectorAll(`${SEL_VLIST} div[data-index]`);
+                for (const wrapper of items) {
+                    if (wrapper.querySelector(SEL_NAME)?.textContent.trim() !== parentName) continue;
+                    wrapper.style.removeProperty('display');
+                    delete wrapper.dataset.crackHierHide;
+                    wrapper.querySelector('button.flex.items-center.gap-2')
+                        ?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    return;
+                }
+            }
+            // 타임아웃: 전체 보관함 뷰에 그대로 머묾 (플랫폼 기본 동작)
+        });
+    }
+
+    function openSubArchiveModal(curName) {
+        document.getElementById('crack-sub-modal')?.remove();
+
+        const children  = getArchiveChildren(curName);
+        // getArchiveNames()는 archive-list/edit 뷰에서만 캐싱 → 보관함 이름만 포함
+        // collectVisibleArchiveNames()는 archive-inner 뷰에서 채팅 세션까지 수집하므로 제외
+        const allNames  = getArchiveNames()
+            .filter(n =>
+                n !== curName &&                 // 자기 자신 제외
+                !children.includes(n) &&         // 이미 현재의 자식 제외
+                getArchiveParent(n) === null      // 이미 다른 보관함의 자식 제외
+            );
+
+        const modal = document.createElement('div');
+        modal.id = 'crack-sub-modal';
+        modal.innerHTML = `
+            <div class="csub-box">
+                <div class="csub-header">📂 "${curName}" 하위 보관함</div>
+
+                <div class="csub-section-title">현재 하위 보관함</div>
+                <div class="csub-children" id="csub-children-list">
+                    ${children.length
+                        ? children.map(n => `
+                            <div class="csub-child-row">
+                                <span>📂 ${n}</span>
+                                <button class="csub-remove-btn" data-name="${n}" title="연결 해제">✕</button>
+                            </div>`).join('')
+                        : '<div class="csub-empty">없음</div>'}
+                </div>
+
+                <div class="csub-section-title">기존 보관함을 하위로 등록</div>
+                <div class="csub-assign-row">
+                    <select id="csub-select" class="csub-select">
+                        <option value="">— 선택 —</option>
+                        ${allNames.map(n => `<option value="${n}">📂 ${n}</option>`).join('')}
+                    </select>
+                    <button id="csub-assign-btn" class="csub-btn" style="background:#FF4432;color:#fff;border-color:#FF4432;flex-shrink:0">등록</button>
+                </div>
+                ${!allNames.length ? '<div class="csub-hint">※ 등록 가능한 보관함이 없습니다.<br>전체 보관함 목록을 먼저 방문하면 목록이 채워집니다.</div>' : ''}
+
+                <div class="csub-footer">
+                    <button id="csub-close" class="csub-btn">닫기</button>
+                </div>
+            </div>`;
+        document.body.appendChild(modal);
+
+        // 연결 해제
+        modal.querySelectorAll('.csub-remove-btn').forEach(b => {
+            b.addEventListener('click', () => {
+                setArchiveParent(b.dataset.name, null);
+                openSubArchiveModal(curName);
+            });
+        });
+
+        // 기존 보관함 등록
+        modal.querySelector('#csub-assign-btn').onclick = () => {
+            const name = modal.querySelector('#csub-select').value;
+            if (!name) return;
+            setArchiveParent(name, curName);
+            openSubArchiveModal(curName);
+        };
+
+        modal.querySelector('#csub-close').onclick = () => modal.remove();
+        modal.onclick = e => { if (e.target === modal) modal.remove(); };
+        const onKey = e => { if (e.key === 'Escape') { modal.remove(); document.removeEventListener('keydown', onKey); } };
+        document.addEventListener('keydown', onKey);
+    }
+
+    /* ================================================================
+       10. 메모 UI (모든 뷰 공통)
+    ================================================================ */
     function injectMemoUI() {
-        document.querySelectorAll('a[href*="/stories/"][href*="/episodes/"]').forEach(link => {
+        document.querySelectorAll(`${SEL_LINK}:not([data-crack-memo])`).forEach(link => {
             const href = link.getAttribute('href');
             if (!href) return;
+            cacheSession(href, extractTitle(link));
 
-            // ⋮ 버튼 위치 탐색
-            const moreBtn = link.querySelector('button[aria-haspopup="menu"]');
+            const moreBtn = link.querySelector(SEL_MORE_BTN);
             if (!moreBtn) return;
-            const titleRow = moreBtn.closest('div');
-            if (!titleRow) return;
+            const titleRow = moreBtn.parentElement;
 
-            // ── 이름 변경 후 재렌더 대응 ──────────────────────────────
-            // data-memoInjected 대신 실제 버튼 존재 여부로 판단.
-            // 플랫폼이 카드 내부를 다시 그리면 버튼이 사라지므로 재주입 필요.
-            const alreadyHasBtn = !!titleRow.querySelector('.crack-memo-btn');
-
-            if (!alreadyHasBtn) {
+            if (!titleRow.querySelector('.crack-memo-btn')) {
                 const memoBtn = document.createElement('button');
-                memoBtn.className = moreBtn.className;
+                memoBtn.className = 'crack-memo-btn';
                 memoBtn.setAttribute('type', 'button');
-                memoBtn.setAttribute('title', '메모');
-                memoBtn.classList.add('crack-memo-btn');
-                memoBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" fill="var(--icon_primary)" viewBox="0 0 24 24" width="14px" height="14px"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>`;
+                memoBtn.title = '메모';
+                memoBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" width="14" height="14">
+                    <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>`;
                 memoBtn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); openMemoModal(href); });
                 titleRow.insertBefore(memoBtn, moreBtn);
             }
 
-            // 미리보기: 없으면 추가, 이미 있으면 스킵
-            const bottomArea = link.querySelector('.css-1owehid');
-            if (bottomArea && !bottomArea.querySelector('.crack-memo-preview')) {
+            const contentArea = link.querySelector('div[class*="flex-col"][class*="flex-1"]');
+            if (contentArea && !contentArea.querySelector('.crack-memo-preview')) {
                 const preview = document.createElement('div');
-                preview.className = 'crack-memo-preview';
+                preview.className        = 'crack-memo-preview';
                 preview.dataset.memoHref = href;
                 preview.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); openMemoModal(href); });
-                bottomArea.appendChild(preview);
+                contentArea.appendChild(preview);
             }
 
-            // 카드 높이 고정 해제
-            link.querySelector('.css-7ylhi9')?.classList.add('crack-memo-card');
+            link.setAttribute('data-crack-memo', '1');
         });
+
         refreshPreviews();
+        injectNameAnimation();
     }
 
     function refreshPreviews() {
-        document.querySelectorAll('.crack-memo-preview[data-memo-href]').forEach(el => {
+        document.querySelectorAll('.crack-memo-preview').forEach(el => {
             const text = getMemo(el.dataset.memoHref);
             el.textContent = text ? '📝 ' + text : '';
             el.style.display = text ? 'block' : 'none';
         });
     }
 
-    // =================================================================
-    // 5. 메모 모달
-    // =================================================================
+    /* ================================================================
+       11. 이름 팝업 & 애니메이션
+    ================================================================ */
+    function injectNameAnimation() {
+        document.querySelectorAll(`${SEL_LINK} ${SEL_NAME}:not([data-crack-anim])`).forEach(span => {
+            span.setAttribute('data-crack-anim', '1');
+            requestAnimationFrame(() => {
+                const sw = span.scrollWidth, cw = span.clientWidth;
+                if (sw > cw) {
+                    span.classList.add('crack-can-animate');
+                    span.style.setProperty('--crack-move-dist', `${(sw - cw + 7) * -1}px`);
+                    if (!span.hasAttribute('title')) span.setAttribute('title', span.textContent.trim());
+                } else {
+                    span.classList.remove('crack-can-animate');
+                    span.style.removeProperty('--crack-move-dist');
+                }
+            });
+        });
+    }
+
+    /* ================================================================
+       12. 이어하기 인터셉트
+    ================================================================ */
+    function getSessionsForStory(storyId) {
+        const pattern = `/stories/${storyId}/episodes/`;
+        const seen = new Set(), results = [];
+        Object.entries(getCache()).forEach(([href, info]) => {
+            if (href.includes(pattern) && !seen.has(href)) {
+                seen.add(href);
+                results.push({ href, name: info.title || href.split('/').pop() });
+            }
+        });
+        document.querySelectorAll(`a[href*="${pattern}"]`).forEach(a => {
+            const h = a.getAttribute('href');
+            if (!h || seen.has(h)) return;
+            seen.add(h);
+            results.push({ href: h, name: extractTitle(a) });
+        });
+        return results;
+    }
+
+    function interceptContinueButtons() {
+        document.querySelectorAll('a:not([data-csp-done]), button:not([data-csp-done])').forEach(el => {
+            if ((el.innerText || el.textContent || '').trim() !== '이어하기') return;
+            el.setAttribute('data-csp-done', '1');
+            el.addEventListener('click', e => {
+                let storyId = null, m;
+                m = (el.getAttribute('href') || '').match(/\/stories\/([^/?#]+)/);
+                if (m) storyId = m[1];
+                if (!storyId) {
+                    let node = el.parentElement;
+                    while (node && node !== document.body) {
+                        m = (node.getAttribute?.('href') || '').match(/\/stories\/([^/?#]+)/);
+                        if (m) { storyId = m[1]; break; }
+                        const ds = node.dataset?.storyId || node.dataset?.story;
+                        if (ds) { storyId = ds; break; }
+                        node = node.parentElement;
+                    }
+                }
+                if (!storyId) { m = window.location.pathname.match(/\/stories\/([^/?#]+)/);   if (m) storyId = m[1]; }
+                if (!storyId) { m = window.location.pathname.match(/\/detail\/([^/?#]+)/);    if (m) storyId = m[1]; }
+                if (!storyId) return;
+                const sessions = getSessionsForStory(storyId);
+                if (sessions.length <= 1) return;
+                e.preventDefault(); e.stopPropagation();
+                openSessionPickerModal(sessions);
+            }, true);
+        });
+    }
+
+    /* ================================================================
+       13. 메모 모달
+    ================================================================ */
     function openMemoModal(href) {
         document.getElementById('crack-memo-modal')?.remove();
         const current = getMemo(href);
-
-        const title = (() => {
-            const a = document.querySelector(`a[href="${href}"]`);
-            return a ? extractTitle(a) : href;
-        })();
-
-        const modal = document.createElement('div');
-        modal.id = 'crack-memo-modal';
+        const title   = getCache()[href]?.title || href;
+        const modal   = document.createElement('div');
+        modal.id      = 'crack-memo-modal';
         modal.innerHTML = `
             <div class="cmemo-box">
                 <div class="cmemo-header">
                     <span class="cmemo-icon">📝</span>
                     <span class="cmemo-title" title="${title}">${title}</span>
                 </div>
-                <textarea id="cmemo-textarea" placeholder="이 세션에 대한 메모를 입력하세요...">${current}</textarea>
+                <textarea id="cmemo-ta" placeholder="이 세션에 대한 메모를 입력하세요...">${current}</textarea>
                 <div class="cmemo-footer">
-                    <button id="cmemo-delete" class="cmemo-btn cmemo-btn-danger" ${current ? '' : 'style="display:none"'}>삭제</button>
+                    <button id="cmemo-del" class="cmemo-btn cmemo-btn-danger" ${current ? '' : 'style="display:none"'}>삭제</button>
                     <div style="flex:1"></div>
                     <button id="cmemo-cancel" class="cmemo-btn">취소</button>
                     <button id="cmemo-save" class="cmemo-btn cmemo-btn-primary">저장</button>
                 </div>
-            </div>
-        `;
+            </div>`;
         document.body.appendChild(modal);
-
-        const ta = modal.querySelector('#cmemo-textarea');
-        ta.focus();
-        ta.setSelectionRange(ta.value.length, ta.value.length);
-
+        const ta = modal.querySelector('#cmemo-ta');
+        ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
         modal.querySelector('#cmemo-save').onclick   = () => { saveMemo(href, ta.value); refreshPreviews(); modal.remove(); };
         modal.querySelector('#cmemo-cancel').onclick = () => modal.remove();
-        modal.querySelector('#cmemo-delete').onclick = () => {
+        modal.querySelector('#cmemo-del').onclick    = () => {
             if (confirm('메모를 삭제하시겠습니까?')) { saveMemo(href, ''); refreshPreviews(); modal.remove(); }
         };
         modal.onclick = e => { if (e.target === modal) modal.remove(); };
-
         const onKey = e => { if (e.key === 'Escape') { modal.remove(); document.removeEventListener('keydown', onKey); } };
         document.addEventListener('keydown', onKey);
     }
 
-    // =================================================================
-    // 6. 폴더 관리 버튼
-    // =================================================================
-    function injectManagerButton() {
-        if (document.getElementById('my-folder-manager-btn')) return;
-
-        let hdr = null;
-        for (const el of document.querySelectorAll('p, span, div')) {
-            if (el.innerText && el.innerText.trim() === '채팅 내역') { hdr = el; break; }
-        }
-        if (!hdr) return;
-        const container = hdr.closest('div');
-        if (!container) return;
-
-        let target = null;
-        for (const btn of container.querySelectorAll('button')) {
-            if (btn.innerText.trim() === '편집' && !btn.id) { target = btn; break; }
-        }
-        if (!target) return;
-
-        const btn = target.cloneNode(true);
-        btn.id = 'my-folder-manager-btn';
-        const sp = btn.querySelector('span');
-        if (sp) sp.innerText = '폴더 관리'; else btn.innerText = '폴더 관리';
-        btn.style.marginRight = '8px';
-        btn.onclick = e => {
-            e.preventDefault(); e.stopPropagation();
-            if (document.getElementById('my-folder-settings-modal')) return;
-            const ex = document.getElementById('my-folder-manager-modal');
-            if (ex) ex.remove(); else openFolderManagerModal();
-        };
-        target.parentElement.insertBefore(btn, target);
-    }
-
-    // =================================================================
-    // 7. 검색창
-    // =================================================================
-    function injectSearchBar() {
-        if (document.getElementById('my-search-container')) return;
-        const root = getSidebarRoot();
-        if (!root || !root.parentNode) return;
-
-        const c = document.createElement('div');
-        c.id = 'my-search-container';
-        c.innerHTML = `
-            <div id="my-search-wrapper">
-                <span class="my-search-icon">🔍</span>
-                <input type="text" id="my-search-input" placeholder="공백 없이 검색해도 됩니다">
-            </div>
-        `;
-        root.parentNode.insertBefore(c, root);
-        document.getElementById('my-search-input').addEventListener('input', e => filterSessions(e.target.value));
-    }
-
-    function filterSessions(raw) {
-        const kw = raw.toLowerCase().replace(/\s+/g, '');
-        const root = getSidebarRoot();
-        if (!root) return;
-
-        root.querySelectorAll('a[href*="/stories/"]').forEach(a => {
-            const t    = extractTitle(a).toLowerCase().replace(/\s+/g, '');
-            const tp   = (a.querySelector('.chat-list-item-topic')?.innerText || '').toLowerCase().replace(/\s+/g, '');
-            const memo = getMemo(a.getAttribute('href') || '').toLowerCase().replace(/\s+/g, '');
-            const show = !kw || t.includes(kw) || tp.includes(kw) || memo.includes(kw);
-            if (show) a.removeAttribute('data-search-hidden');
-            else      a.setAttribute('data-search-hidden', '1');
-        });
-
-        root.querySelectorAll('.my-sb-folder').forEach(el => {
-            if (!kw) { el.removeAttribute('data-search-hidden'); return; }
-            const vis = el.querySelectorAll('a[href*="/stories/"]:not([data-search-hidden])');
-            if (vis.length === 0) el.setAttribute('data-search-hidden', '1');
-            else                  el.removeAttribute('data-search-hidden');
-        });
-    }
-
-    // =================================================================
-    // 8. 통합 폴더 관리 모달
-    // =================================================================
-    function openFolderManagerModal() {
-        document.getElementById('my-folder-manager-modal')?.remove();
+    /* ================================================================
+       14. 이어하기 세션 선택 모달
+    ================================================================ */
+    function openSessionPickerModal(sessions) {
+        document.getElementById('crack-picker-modal')?.remove();
         const modal = document.createElement('div');
-        modal.id = 'my-folder-manager-modal';
-        document.body.appendChild(modal);
-
-        function rebuild() {
-            let folders = getFolders();
-            modal.innerHTML = `
-                <div class="fmgr-box">
-                    <div class="fmgr-header">
-                        <span>📁 폴더 관리</span>
-                        <button class="fmgr-btn-new" id="fmgr-new">+ 새 폴더</button>
-                    </div>
-                    <div class="fmgr-list" id="fmgr-list"></div>
-                    <div class="fmgr-footer">
-                        <button class="fmgr-btn" id="fmgr-close">닫기</button>
-                    </div>
-                </div>
-            `;
-            modal.querySelector('#fmgr-new').onclick   = () => { modal.remove(); openSettingsModal(null); };
-            modal.querySelector('#fmgr-close').onclick = () => modal.remove();
-
-            const list = modal.querySelector('#fmgr-list');
-            if (!folders.length) {
-                list.innerHTML = '<div class="fmgr-empty">생성된 폴더가 없습니다.</div>';
-                return;
-            }
-
-            const renderTree = (parentId, depth) => {
-                const siblings = folders.filter(f => (f.parentId || null) === (parentId || null));
-                siblings.forEach((f, i) => {
-                    const row = document.createElement('div');
-                    row.className = 'fmgr-row';
-                    if (depth > 0) row.style.marginLeft = (depth * 16) + 'px';
-                    row.innerHTML = `
-                        <div class="fmgr-row-info">
-                            <span>${depth > 0 ? '└📂' : '📁'}</span>
-                            <span class="fmgr-row-name">${f.name}</span>
-                            <span class="fmgr-row-count">(${f.sessions.length})</span>
-                        </div>
-                        <div class="fmgr-row-btns">
-                            <button class="fmgr-icon-btn bu" ${i === 0 ? 'disabled' : ''}>▲</button>
-                            <button class="fmgr-icon-btn bd" ${i === siblings.length-1 ? 'disabled' : ''}>▼</button>
-                            <button class="fmgr-icon-btn bs">설정</button>
-                            <button class="fmgr-icon-btn bd2 fmgr-danger-txt">삭제</button>
-                        </div>
-                    `;
-                    const swap = (ia, ib) => {
-                        [folders[ia], folders[ib]] = [folders[ib], folders[ia]];
-                        saveFolders(folders); renderSidebarFolders(); rebuild();
-                    };
-                    row.querySelector('.bu').onclick  = () => swap(folders.indexOf(f), folders.indexOf(siblings[i-1]));
-                    row.querySelector('.bd').onclick  = () => swap(folders.indexOf(f), folders.indexOf(siblings[i+1]));
-                    row.querySelector('.bs').onclick  = () => { modal.remove(); openSettingsModal(f.id); };
-                    row.querySelector('.bd2').onclick = () => {
-                        if (!confirm(`'${f.name}'을(를) 삭제하시겠습니까?\n(하위 폴더는 최상위로 분리됩니다. 세션은 유지됩니다.)`)) return;
-                        folders.forEach(c => { if (c.parentId === f.id) c.parentId = null; });
-                        folders = folders.filter(x => x.id !== f.id);
-                        saveFolders(folders); renderSidebarFolders(); rebuild();
-                    };
-                    list.appendChild(row);
-                    renderTree(f.id, depth + 1);
-                });
-            };
-            renderTree(null, 0);
-        }
-        rebuild();
-    }
-
-    // =================================================================
-    // 9. 개별 폴더 설정 모달
-    // =================================================================
-    function openSettingsModal(folderId) {
-        document.getElementById('my-folder-settings-modal')?.remove();
-
-        let folders = getFolders();
-        const isNew = !folderId;
-        let cur = isNew
-            ? { id: 'f_' + Date.now(), name: '', parentId: null, sessions: [] }
-            : folders.find(f => f.id === folderId);
-        if (!cur) return;
-
-        const getDescIds = tid => {
-            let ids = [];
-            folders.filter(f => f.parentId === tid).forEach(c => { ids.push(c.id); ids = ids.concat(getDescIds(c.id)); });
-            return ids;
-        };
-        const invalidPids = new Set(folderId ? [folderId, ...getDescIds(folderId)] : []);
-
-        const root = getSidebarRoot();
-        const raw = []; const seen = new Set();
-        if (root) {
-            root.querySelectorAll('a[href*="/stories/"]').forEach(a => {
-                const h = a.getAttribute('href');
-                if (!h || seen.has(h)) return;
-                seen.add(h);
-                let n = extractTitle(a);
-                if (n.length > 36) n = n.substring(0, 36) + '…';
-                raw.push({ href: h, name: n });
-            });
-        }
-
-        const parentFolder  = cur.parentId ? folders.find(f => f.id === cur.parentId) : null;
-        const parentSet     = new Set(parentFolder ? parentFolder.sessions : []);
-        const curSet        = new Set(cur.sessions);
-        const occupiedElsewhere = new Set();
-        folders.forEach(f => {
-            if (f.id === folderId || f.id === cur.parentId) return;
-            f.sessions.forEach(h => occupiedElsewhere.add(h));
-        });
-        const avail = raw.filter(s => !occupiedElsewhere.has(s.href) || curSet.has(s.href));
-
-        const modal = document.createElement('div');
-        modal.id = 'my-folder-settings-modal';
-        const pOpts = folders.filter(f => !invalidPids.has(f.id))
-            .map(f => `<option value="${f.id}" ${f.id === cur.parentId ? 'selected' : ''}>${f.name}</option>`).join('');
-
-        modal.innerHTML = `
-            <div class="fset-box">
-                <div class="fset-header">${isNew ? '새 폴더 생성' : '폴더 설정'}</div>
-                <div class="fset-body">
-                    <div class="fset-field">
-                        <label class="fset-label">폴더 이름</label>
-                        <input type="text" id="fset-name" class="fset-input" value="${cur.name}" placeholder="폴더 이름을 입력하세요">
-                    </div>
-                    <div class="fset-field">
-                        <label class="fset-label">상위 폴더 <span class="fset-label-sub">(선택 시 하위 폴더)</span></label>
-                        <select id="fset-parent" class="fset-select">
-                            <option value="">없음 (최상위)</option>${pOpts}
-                        </select>
-                    </div>
-                    <div class="fset-field">
-                        <label class="fset-label">채팅 세션
-                            <span class="fset-label-sub">(${avail.length}개 이용 가능${parentFolder ? ' · 상위 폴더 세션 포함' : ''})</span>
-                        </label>
-                        <div class="fset-session-list" id="fset-sessions"></div>
-                    </div>
-                </div>
-                <div class="fset-footer">
-                    ${!isNew ? '<button class="fset-btn fset-btn-danger" id="fset-delete">폴더 삭제</button>' : ''}
-                    <div style="flex:1"></div>
-                    <button class="fset-btn" id="fset-cancel">취소</button>
-                    <button class="fset-btn fset-btn-primary" id="fset-save">저장</button>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(modal);
-
-        const sList = modal.querySelector('#fset-sessions');
-        if (!avail.length) {
-            sList.innerHTML = '<div class="fset-empty">이용 가능한 채팅 세션이 없습니다.</div>';
-        } else {
-            avail.forEach(s => {
-                const id  = 'fchk_' + s.href.replace(/\W/g, '_');
-                const memo = getMemo(s.href);
-                const label = memo
-                    ? `${s.name} <span class="fset-session-memo">— ${memo.length > 20 ? memo.substring(0,20)+'…' : memo}</span>`
-                    : s.name;
-                const div = document.createElement('div');
-                div.className = 'fset-session-item';
-                div.innerHTML = `
-                    <input type="checkbox" id="${id}" value="${s.href}" ${curSet.has(s.href) ? 'checked' : ''}>
-                    <label for="${id}" title="${s.name}${memo ? ' — '+memo : ''}">
-                        ${label}
-                        ${parentSet.has(s.href) && !curSet.has(s.href) ? '<span class="fset-badge-parent">상위</span>' : ''}
-                    </label>
-                `;
-                sList.appendChild(div);
-            });
-        }
-
-        const goBack = () => { modal.remove(); openFolderManagerModal(); };
-        modal.querySelector('#fset-cancel').onclick = goBack;
-
-        if (!isNew) {
-            modal.querySelector('#fset-delete').onclick = () => {
-                if (!confirm(`'${cur.name}'을(를) 삭제하시겠습니까?`)) return;
-                let f = getFolders();
-                f.forEach(c => { if (c.parentId === folderId) c.parentId = null; });
-                f = f.filter(x => x.id !== folderId);
-                saveFolders(f); renderSidebarFolders(); goBack();
-            };
-        }
-
-        modal.querySelector('#fset-save').onclick = () => {
-            const nameVal = modal.querySelector('#fset-name').value.trim();
-            if (!nameVal) { alert('폴더 이름을 입력해주세요!'); return; }
-            const newPid     = modal.querySelector('#fset-parent').value || null;
-            const checked    = Array.from(modal.querySelectorAll('#fset-sessions input:checked')).map(cb => cb.value);
-
-            let f = getFolders();
-            if (newPid) {
-                const pi = f.findIndex(x => x.id === newPid);
-                if (pi !== -1) f[pi] = { ...f[pi], sessions: f[pi].sessions.filter(h => !checked.includes(h)) };
-            }
-            const updated = { ...cur, name: nameVal, parentId: newPid, sessions: checked };
-            if (isNew) f.push(updated);
-            else { const i = f.findIndex(x => x.id === folderId); if (i !== -1) f[i] = updated; }
-
-            saveFolders(f); renderSidebarFolders(); goBack();
-        };
-    }
-
-    // =================================================================
-    // 10. 사이드바 폴더 렌더링
-    //
-    //  깜빡임 방지 핵심:
-    //  → foldersSig()로 데이터가 실제로 바뀌었는지 먼저 확인
-    //  → 이미 올바른 위치에 납치된 세션이 모두 있으면 렌더 생략
-    //  → DOM 조작 시 _isRendering 플래그로 재진입 차단
-    // =================================================================
-    function renderSidebarFolders() {
-        if (_isRendering) return;
-
-        const root = getSidebarRoot();
-        if (!root) return;
-
-        const folders = getFolders();
-        const sig = foldersSig(folders);
-
-        // ── 스킵 판단 ─────────────────────────────────────────────
-        if (sig === _lastRenderSig) {
-            // 데이터 미변경 → 배정된 세션이 이미 올바른 폴더 안에 있는지만 확인
-            const assigned = new Set(folders.flatMap(f => f.sessions));
-            const hasOrphan = Array.from(
-                root.querySelectorAll('a[href*="/stories/"]:not([data-in-folder])')
-            ).some(a => assigned.has(a.getAttribute('href')));
-            if (!hasOrphan) return; // 이미 올바른 상태 → 건너뜀
-        }
-        // ──────────────────────────────────────────────────────────
-
-        _isRendering = true;
-        try {
-            // ① 납치된 세션 원위치 복원 (wrapper 제거 전에 먼저)
-            const existing = root.querySelector('.my-sb-folder-wrapper');
-            if (existing) {
-                existing.querySelectorAll('a[data-in-folder]').forEach(a => {
-                    a.removeAttribute('data-in-folder');
-                    root.appendChild(a);
-                });
-                existing.remove();
-            }
-
-            if (!folders.length) { _lastRenderSig = sig; return; }
-
-            // ② 세션 맵
-            const assigned = new Set(folders.flatMap(f => f.sessions));
-            const sessionMap = new Map();
-            root.querySelectorAll('a[href*="/stories/"]').forEach(a => {
-                const h = a.getAttribute('href');
-                if (h && !sessionMap.has(h)) sessionMap.set(h, a);
-            });
-
-            // ③ 폴더 DOM 빌더 (재귀)
-            const buildFolder = (fd, depth) => {
-                const isOpen    = expandedFolders.has(fd.id);
-                const subs      = folders.filter(f => f.parentId === fd.id);
-                const wrapper   = document.createElement('div');
-                wrapper.className = depth > 0 ? 'my-sb-folder my-sb-subfolder' : 'my-sb-folder';
-
-                const hdr = document.createElement('div');
-                hdr.className = 'my-sb-folder-header';
-                const total = fd.sessions.length + subs.reduce((s, f) => s + f.sessions.length, 0);
-                hdr.innerHTML = `
-                    <span>📂</span>
-                    <span class="my-sb-name">${fd.name}</span>
-                    <span class="my-sb-count">(${total})</span>
-                `;
-
-                const content = document.createElement('div');
-                content.className = 'my-sb-folder-content';
-                if (!isOpen) content.style.display = 'none';
-
-                hdr.addEventListener('click', () => {
-                    const op = content.style.display === 'none';
-                    content.style.display = op ? '' : 'none';
-                    if (op) expandedFolders.add(fd.id); else expandedFolders.delete(fd.id);
-                });
-
-                subs.forEach(sub => content.appendChild(buildFolder(sub, depth + 1)));
-
-                // ④ 납치
-                fd.sessions.forEach(h => {
-                    const a = sessionMap.get(h);
-                    if (!a) return;
-                    a.setAttribute('data-in-folder', '1');
-                    content.appendChild(a);
-                });
-
-                wrapper.appendChild(hdr);
-                wrapper.appendChild(content);
-                return wrapper;
-            };
-
-            const outer = document.createElement('div');
-            outer.className = 'my-sb-folder-wrapper';
-            folders.filter(f => !f.parentId).forEach(rf => outer.appendChild(buildFolder(rf, 0)));
-            root.insertBefore(outer, root.firstChild);
-
-            _lastRenderSig = sig;
-
-            // 메모 UI + 검색 필터 재적용
-            injectMemoUI();
-            const si = document.getElementById('my-search-input');
-            if (si && si.value) filterSessions(si.value);
-
-        } finally {
-            _isRendering = false;
-        }
-    }
-
-    // =================================================================
-    // 11. 이어하기 세션 선택
-    // =================================================================
-
-    /**
-     * storyId에 해당하는 사이드바 세션 목록 반환
-     * @param {string} storyId
-     * @returns {{ href: string, name: string }[]}
-     */
-    function getSessionsForStory(storyId) {
-        const root = getSidebarRoot();
-        const results = [];
-        const seen = new Set();
-        const selector = `a[href*="/stories/${storyId}/episodes/"]`;
-        // 사이드바 + 전체 DOM 탐색 (폴더 안에 숨겨진 세션 포함)
-        const containers = [root, document.body];
-        for (const c of containers) {
-            if (!c) continue;
-            c.querySelectorAll(selector).forEach(a => {
-                const h = a.getAttribute('href');
-                if (!h || seen.has(h)) return;
-                seen.add(h);
-                results.push({ href: h, name: extractTitle(a) });
-            });
-        }
-        return results;
-    }
-
-    /**
-     * 세션 선택 모달 열기
-     * @param {{ href: string, name: string }[]} sessions
-     * @param {string} fallbackHref  세션이 0개일 때 이동할 원본 href
-     */
-    function openSessionPickerModal(sessions, fallbackHref) {
-        document.getElementById('crack-session-picker-modal')?.remove();
-
-        const modal = document.createElement('div');
-        modal.id = 'crack-session-picker-modal';
-
-        const listHTML = sessions.map((s, i) => {
-            const memo = getMemo(s.href);
-            const memoTxt = memo ? `<span class="csp-memo">📝 ${memo.length > 30 ? memo.substring(0, 30) + '…' : memo}</span>` : '';
-            return `
-                <a class="csp-item" href="${s.href}" data-idx="${i}">
-                    <span class="csp-name">${s.name}</span>
-                    ${memoTxt}
-                </a>`;
-        }).join('');
-
+        modal.id = 'crack-picker-modal';
         modal.innerHTML = `
             <div class="csp-box">
                 <div class="csp-header">
@@ -623,198 +723,272 @@
                     <span class="csp-title">이어할 세션을 선택하세요</span>
                     <span class="csp-count">${sessions.length}개</span>
                 </div>
-                <div class="csp-list">${listHTML}</div>
-                <div class="csp-footer">
-                    <button class="csp-btn" id="csp-cancel">취소</button>
+                <div class="csp-list">
+                    ${sessions.map(s => {
+                        const memo = getMemo(s.href);
+                        return `<a class="csp-item" href="${s.href}">
+                                    <span class="csp-name">${s.name}</span>
+                                    ${memo ? `<span class="csp-memo">📝 ${memo.length > 30 ? memo.slice(0,30)+'…' : memo}</span>` : ''}
+                                </a>`;
+                    }).join('')}
                 </div>
-            </div>
-        `;
+                <div class="csp-footer"><button class="csp-btn" id="csp-cancel">취소</button></div>
+            </div>`;
         document.body.appendChild(modal);
-
         modal.querySelectorAll('.csp-item').forEach(a => {
-            a.addEventListener('click', e => {
-                e.preventDefault();
-                modal.remove();
-                window.location.href = a.getAttribute('href');
-            });
+            a.addEventListener('click', e => { e.preventDefault(); modal.remove(); window.location.href = a.getAttribute('href'); });
         });
         modal.querySelector('#csp-cancel').onclick = () => modal.remove();
-        modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
-
-        const onKey = e => {
-            if (e.key === 'Escape') { modal.remove(); document.removeEventListener('keydown', onKey); }
-        };
+        modal.onclick = e => { if (e.target === modal) modal.remove(); };
+        const onKey = e => { if (e.key === 'Escape') { modal.remove(); document.removeEventListener('keydown', onKey); } };
         document.addEventListener('keydown', onKey);
     }
 
-    /**
-     * "이어하기" 텍스트를 가진 버튼/링크를 찾아 클릭 이벤트 인터셉트
-     * storyId 추출 우선순위:
-     *   1) 요소 자신의 href
-     *   2) 가장 가까운 ancestor의 href/data-story
-     *   3) 현재 페이지 URL
-     */
-    function interceptContinueButtons() {
-        // 이미 처리된 요소는 건너뜀
-        const candidates = document.querySelectorAll(
-            'a:not([data-csp-intercepted]), button:not([data-csp-intercepted])'
-        );
-        candidates.forEach(el => {
-            const text = (el.innerText || el.textContent || '').trim();
-            if (text !== '이어하기') return;
+    /* ================================================================
+       15. 메인 루프
+    ================================================================ */
+    function tick() {
+        const view = detectView();
 
-            el.setAttribute('data-csp-intercepted', '1');
+        // ── 뷰별 UI ─────────────────────────────────────────────
+        if (view === 'main') {
+            hideNativeArchiveSection();
+            injectViewTabs();
+            injectSearchBar();
+            document.getElementById('crack-create-arch-btn')?.remove();
+            document.getElementById('crack-child-archives')?.remove();
+            _getDynStyle().textContent = '';
 
-            el.addEventListener('click', e => {
-                // storyId 추출
-                let storyId = null;
+        } else if (view === 'archive-list') {
+            cacheArchiveNames();
+            injectViewTabs();
+            injectSearchBar();
+            applyArchiveHierarchy();
+            document.getElementById('crack-create-arch-btn')?.remove();
+            document.getElementById('crack-child-archives')?.remove();
 
-                // 1) 자신의 href
-                const selfHref = el.getAttribute('href') || '';
-                let m = selfHref.match(/\/stories\/([^/?#]+)/);
-                if (m) storyId = m[1];
+        } else if (view === 'archive-edit') {
+            cacheArchiveNames();
+            document.getElementById('crack-view-tabs')?.remove();
+            document.getElementById('crack-search-container')?.remove();
+            injectMoveButtons();
+            applyArchiveHierarchy();
+            document.getElementById('crack-create-arch-btn')?.remove();
+            document.getElementById('crack-child-archives')?.remove();
+            _getDynStyle().textContent = '';
 
-                // 2) ancestor href/data-story-id
-                if (!storyId) {
-                    let node = el.parentElement;
-                    while (node && node !== document.body) {
-                        const aHref = node.getAttribute?.('href') || '';
-                        m = aHref.match(/\/stories\/([^/?#]+)/);
-                        if (m) { storyId = m[1]; break; }
-                        const ds = node.dataset?.storyId || node.dataset?.story;
-                        if (ds) { storyId = ds; break; }
-                        node = node.parentElement;
-                    }
-                }
+        } else if (view === 'archive-inner') {
+            document.getElementById('crack-view-tabs')?.remove();
+            injectCreateArchiveBtn();
+            injectBackIntercept();       // 부모 보관함 있을 때 뒤로가기 인터셉트
+            injectChildArchivesPanel();
+            injectSearchBar();
+        }
 
-                // 3) 현재 URL
-                if (!storyId) {
-                    m = window.location.pathname.match(/\/stories\/([^/?#]+)/);
-                    if (m) storyId = m[1];
-                }
-                // detail 페이지 패턴: /detail/{storyId}
-                if (!storyId) {
-                    m = window.location.pathname.match(/\/detail\/([^/?#]+)/);
-                    if (m) storyId = m[1];
-                }
-
-                if (!storyId) return; // storyId 없으면 기본 동작 유지
-
-                const sessions = getSessionsForStory(storyId);
-                if (sessions.length <= 1) return; // 1개 이하: 기본 동작
-
-                e.preventDefault();
-                e.stopPropagation();
-                openSessionPickerModal(sessions, selfHref);
-            }, true /* capture */);
-        });
+        // ── 공통 ─────────────────────────────────────────────────
+        injectMemoUI();
+        interceptContinueButtons();
+        adjustScrollerHeight();
     }
 
-    // =================================================================
-    // 12. 실행
-    // =================================================================
-    setInterval(() => {
-        injectManagerButton();
-        injectSearchBar();
-        injectMemoUI();
-        renderSidebarFolders();
-        interceptContinueButtons();
-    }, 3000);
+    setInterval(tick, 3000);
 
     let _debounce = null;
     new MutationObserver(mutations => {
-        if (_isRendering) return;
-        const internal = mutations.every(m => m.target.closest?.('.my-sb-folder-wrapper'));
-        if (internal) return;
+        const allInternal = mutations.every(m =>
+            m.target.closest?.('#crack-memo-modal')   ||
+            m.target.closest?.('#crack-picker-modal') ||
+            m.target.closest?.('#crack-move-modal')   ||
+            m.target.closest?.('#crack-sub-modal')    ||
+            m.target.closest?.('#crack-search-container')
+        );
+        if (allInternal) return;
         clearTimeout(_debounce);
-        _debounce = setTimeout(() => {
-            injectManagerButton();
-            injectSearchBar();
-            injectMemoUI();
-            renderSidebarFolders();
-            interceptContinueButtons();
-        }, 400);
+        _debounce = setTimeout(tick, 250);
     }).observe(document.body, { childList: true, subtree: true });
 
-    // =================================================================
-    // 13. 스타일
-    // =================================================================
+    tick();
+
+    /* ================================================================
+       16. 스타일
+    ================================================================ */
     GM_addStyle(`
-        /* 검색 숨김 */
-        a[data-search-hidden="1"]            { display: none !important; }
-        .my-sb-folder[data-search-hidden="1"]{ display: none !important; }
+        /* ── 보관함 섹션 강제 숨김 (data-attribute CSS 방식) ── */
+        /* inline style 대신 CSS를 사용해 React 재조정에 의한 초기화 방지 */
+        [data-crack-arch-section]  { display: none !important; }
+        [data-crack-arch-divider]  { display: none !important; }
+        [data-crack-chat-hdr]      { display: none !important; }
+
+        /* ── 이름 애니메이션 ── */
+        ${SEL_NAME} {
+            display: inline-block !important;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            transition: transform 0.3s;
+        }
+        ${SEL_NAME}.crack-can-animate:hover {
+            text-overflow: clip !important;
+            overflow: visible !important;
+            animation: crack-name-scroll 5s linear infinite;
+            padding-right: 50px;
+            position: relative; z-index: 1;
+        }
+        @keyframes crack-name-scroll {
+            0%   { transform: translateX(0); }
+            45%  { transform: translateX(var(--crack-move-dist)); }
+            55%  { transform: translateX(var(--crack-move-dist)); }
+            100% { transform: translateX(0); }
+        }
+
+        /* ── 뷰 탭 ── */
+        #crack-view-tabs {
+            display: flex;
+            flex-shrink: 0;
+            border-bottom: 1px solid var(--border, rgba(128,128,128,0.2));
+        }
+        .crack-tab-btn {
+            flex: 1; padding: 8px 4px;
+            border: none; background: transparent;
+            color: var(--muted-foreground, #888);
+            font-size: 13px; font-weight: 600; cursor: pointer;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+            transition: color .15s, border-color .15s;
+        }
+        .crack-tab-btn:hover { color: var(--foreground, #eee); }
+        .crack-tab-active { color: var(--primary, #FF4432) !important; border-bottom-color: var(--primary, #FF4432) !important; }
 
         /* ── 검색창 ── */
-        #my-search-container {
-            display: flex; align-items: center;
-            padding: 6px 12px;
-            border-bottom: 1px solid rgba(125,125,125,0.15);
+        #crack-search-container {
+            display: flex; flex-shrink: 0;
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--border, rgba(128,128,128,0.15));
         }
-        #my-search-wrapper {
+        #crack-search-inner {
             display: flex; align-items: center; width: 100%;
             background: rgba(128,128,128,0.1);
             border-radius: 6px; padding: 4px 8px;
-            border: 1px solid transparent; transition: border .2s;
+            border: 1px solid transparent; transition: border-color .2s;
         }
-        #my-search-wrapper:focus-within { border-color: var(--primary, #00bbff); }
-        #my-search-input {
+        #crack-search-inner:focus-within { border-color: var(--primary, #FF4432); }
+        #crack-search-input {
             border: none; background: none; outline: none;
             color: inherit; font-size: 13px; width: 100%; margin-left: 4px;
         }
-        .my-search-icon { font-size: 13px; opacity: .55; }
-
-        /* ── 사이드바 폴더 ── */
-        .my-sb-folder-wrapper { margin-bottom: 8px; }
-
-        .my-sb-folder {
-            margin-bottom: 4px;
-            background-color: rgba(125,125,125,0.08);
-            border: 1px solid rgba(125,125,125,0.2);
-            border-radius: 8px; overflow: hidden; color: inherit;
-        }
-        .my-sb-subfolder {
-            margin: 3px 6px 3px 14px; border-radius: 6px;
-            background-color: rgba(125,125,125,0.05);
-        }
-        .my-sb-folder-header {
-            display: flex; align-items: center; gap: 6px;
-            padding: 10px 14px; cursor: pointer; font-weight: bold;
-            background-color: rgba(125,125,125,0.1); user-select: none;
-        }
-        .my-sb-folder-header:hover { background-color: rgba(125,125,125,0.18); }
-        .my-sb-name  { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .my-sb-count { margin-left: 4px; font-size: .9em; opacity: .7; font-weight: normal; flex-shrink: 0; }
-        .my-sb-folder-content { border-top: 1px solid rgba(125,125,125,0.1); }
+        .crack-search-icon { font-size: 12px; opacity: .55; flex-shrink: 0; }
 
         /* ── 메모 버튼 ── */
-        /* 플랫폼이 ⋮ 버튼을 a:hover 시에만 표시하는 구조이므로,
-           className을 복사한 메모 버튼도 동일한 hide 규칙을 물려받음.
-           visibility/display/opacity 세 축 모두 강제 표시로 덮어씀. */
         .crack-memo-btn {
             display: inline-flex !important;
-            visibility: visible !important;
-            opacity: .35 !important;
-            transition: opacity .15s;
+            align-items: center; justify-content: center;
+            width: 1rem; height: 1rem; flex-shrink: 0;
+            background: none; border: none; cursor: pointer;
+            color: var(--icon_tertiary, currentColor);
+            opacity: 0; transition: opacity .15s; padding: 0;
         }
         a:hover .crack-memo-btn, .crack-memo-btn:hover { opacity: 1 !important; }
-        a[data-memo-injected="1"]:has(.crack-memo-preview:not([style*="display: none"])) .crack-memo-btn {
-            opacity: 1 !important;
-            color: var(--brand-color, #FF4432) !important;
-        }
-        .crack-memo-btn svg { pointer-events: none; }
 
-        /* 카드 높이 자동 */
-        .crack-memo-card { height: auto !important; min-height: 64px; }
-
-        /* 메모 미리보기 */
+        /* ── 메모 미리보기 ── */
         .crack-memo-preview {
             display: none; font-size: 11px; line-height: 1.4;
-            color: var(--text_tertiary, #999);
-            padding: 3px 0 4px; max-height: 36px;
+            color: var(--muted-foreground, #999);
             overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
             width: 100%; cursor: pointer;
         }
-        .crack-memo-preview:hover { color: var(--text_primary, #333); }
+
+        /* ── 편집 뷰 이동 버튼 ── */
+        .crack-move-btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 16px; height: 16px;
+            background: none; border: none; cursor: pointer;
+            color: var(--line_gray_2, #888);
+            border-radius: 3px; opacity: .5;
+            transition: opacity .15s, background .15s;
+        }
+        .crack-move-btn:hover { opacity: 1; background: var(--accent, rgba(128,128,128,0.15)); }
+
+        /* ── 보관함 만들기 버튼 (내부 뷰) ── */
+        .crack-icon-action-btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 24px; height: 24px;
+            background: none; border: none; cursor: pointer;
+            color: var(--line_gray_2, #888); border-radius: 4px; flex-shrink: 0;
+            opacity: .6; transition: opacity .15s, background .15s;
+        }
+        .crack-icon-action-btn:hover { opacity: 1; background: var(--accent, rgba(128,128,128,0.15)); }
+
+        /* ── 자식 보관함 패널 ── */
+        #crack-child-archives {
+            flex-shrink: 0;
+            border-bottom: 1px solid var(--border, rgba(128,128,128,0.15));
+            padding: 2px 0 4px;
+        }
+        .cca-header {
+            font-size: 11px; font-weight: 600; padding: 6px 10px 2px;
+            color: var(--muted-foreground, #888); letter-spacing: .04em; text-transform: uppercase;
+        }
+        .cca-item {
+            display: flex; align-items: center; gap: 8px;
+            width: 100%; padding: 8px 8px;
+            border: none; background: none; text-align: left;
+            cursor: pointer; color: inherit;
+            transition: background .12s;
+        }
+        .cca-item:hover { background: var(--accent, rgba(128,128,128,.1)); }
+        .cca-thumb {
+            width: 48px; height: 48px; flex-shrink: 0;
+            border-radius: 8px;
+            border: 1px solid var(--border, rgba(128,128,128,.25));
+            background: var(--surface-secondary, rgba(128,128,128,.1));
+            display: flex; align-items: center; justify-content: center;
+            color: var(--muted-foreground, #888);
+        }
+        .cca-info { flex: 1; min-width: 0; overflow: hidden; }
+        .cca-name {
+            display: block; font-size: 13px; font-weight: 500;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+
+        /* ── 이동 모달 ── */
+        #crack-move-modal {
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,.55);
+            display: flex; align-items: center; justify-content: center;
+            z-index: 99999;
+        }
+        .cmove-box {
+            background: var(--surface_secondary, #1e1e1e);
+            color: var(--text_primary, #eee);
+            border-radius: 12px; width: 360px; max-width: 93vw; max-height: 70vh;
+            display: flex; flex-direction: column;
+            box-shadow: 0 12px 32px rgba(0,0,0,.7);
+            border: 1px solid rgba(255,255,255,.08); overflow: hidden;
+        }
+        .cmove-header {
+            display: flex; align-items: center; gap: 8px;
+            padding: 14px 16px; font-size: 14px; font-weight: 700;
+            border-bottom: 1px solid rgba(255,255,255,.08); flex-shrink: 0;
+        }
+        .cmove-target { opacity: .7; font-weight: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .cmove-list   { flex: 1; overflow-y: auto; padding: 6px 0; }
+        .cmove-item   {
+            padding: 10px 16px; cursor: pointer; font-size: 13px;
+            transition: background .12s;
+            border-bottom: 1px solid rgba(255,255,255,.04);
+        }
+        .cmove-item:last-child { border-bottom: none; }
+        .cmove-item:hover  { background: rgba(255,255,255,.07); }
+        .cmove-active      { color: var(--primary, #FF4432); font-weight: 600; }
+        .cmove-footer { padding: 10px 16px; border-top: 1px solid rgba(255,255,255,.08); flex-shrink: 0; display: flex; justify-content: flex-end; }
+        .cmove-btn {
+            padding: 6px 16px; border-radius: 6px;
+            border: 1px solid rgba(255,255,255,.15);
+            background: rgba(255,255,255,.06); color: inherit;
+            font-size: 13px; cursor: pointer;
+        }
+        .cmove-btn:hover { background: rgba(255,255,255,.12); }
 
         /* ── 메모 모달 ── */
         #crack-memo-modal {
@@ -832,194 +1006,127 @@
         .cmemo-header { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; }
         .cmemo-icon   { font-size: 18px; flex-shrink: 0; }
         .cmemo-title  { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .75; }
-        #cmemo-textarea {
-            width: 100%; min-height: 120px; max-height: 300px;
-            resize: vertical; padding: 10px 12px;
-            border: 1px solid rgba(0,0,0,.5); border-radius: 8px;
-            background: #e8e8e8; color: #1e1e1e;
-            font-size: 13px; line-height: 1.6;
+        #cmemo-ta {
+            width: 100%; min-height: 120px; max-height: 300px; resize: vertical;
+            padding: 10px 12px; border: 1px solid rgba(0,0,0,.5); border-radius: 8px;
+            background: #e8e8e8; color: #1e1e1e; font-size: 13px; line-height: 1.6;
             box-sizing: border-box; outline: none; font-family: inherit;
-            transition: border-color .15s;
         }
-        #cmemo-textarea:focus   { border-color: #FF4432; }
-        #cmemo-textarea::placeholder { color: rgba(0,0,0,.5); }
+        #cmemo-ta:focus { border-color: #FF4432; }
+        #cmemo-ta::placeholder { color: rgba(0,0,0,.4); }
         .cmemo-footer { display: flex; gap: 8px; align-items: center; }
-        .cmemo-btn {
-            padding: 7px 14px; border-radius: 6px;
-            border: 1px solid rgba(0,0,0,.5);
-            background: rgba(255,255,255,.06); color: #1e1e1e;
-            font-size: 13px; cursor: pointer; transition: background .15s;
-        }
-        .cmemo-btn:hover         { background: rgba(255,255,255,.12); }
+        .cmemo-btn { padding: 7px 14px; border-radius: 6px; border: 1px solid rgba(0,0,0,.4); background: transparent; color: #1e1e1e; font-size: 13px; cursor: pointer; }
+        .cmemo-btn:hover         { background: rgba(0,0,0,.07); }
         .cmemo-btn-primary       { background: #FF4432; color: #fff; border-color: #FF4432; }
-        .cmemo-btn-primary:hover { background: #e03a29; border-color: #e03a29; }
-        .cmemo-btn-danger        { background: transparent; color: #ff6b6b; border-color: rgba(255,59,48,.4); }
-        .cmemo-btn-danger:hover  { background: rgba(255,59,48,.15); border-color: #ff3b30; }
+        .cmemo-btn-primary:hover { background: #e03a29; }
+        .cmemo-btn-danger        { color: #ff6b6b; border-color: rgba(255,59,48,.4); }
+        .cmemo-btn-danger:hover  { background: rgba(255,59,48,.1); }
 
-        /* ── 폴더 관리 모달 ── */
-        #my-folder-manager-modal {
-            position: fixed; inset: 0; background: rgba(0,0,0,.5);
-            z-index: 9999; display: flex; justify-content: center; align-items: center;
-        }
-        .fmgr-box {
-            background: #fff; color: #333; border-radius: 12px; padding: 20px;
-            width: 440px; max-width: 92vw; max-height: 80vh;
-            display: flex; flex-direction: column; gap: 12px;
-            box-shadow: 0 8px 28px rgba(0,0,0,.35);
-        }
-        .fmgr-header { display: flex; align-items: center; justify-content: space-between; font-size: 17px; font-weight: bold; }
-        .fmgr-list   { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 5px; min-height: 60px; }
-        .fmgr-footer { display: flex; justify-content: flex-end; }
-        .fmgr-empty  { text-align: center; padding: 24px 0; color: #999; font-size: 13px; }
-
-        .fmgr-row {
-            display: flex; align-items: center; justify-content: space-between;
-            padding: 8px 10px; border: 1px solid rgba(125,125,125,.2);
-            border-radius: 7px; background: rgba(125,125,125,.04);
-        }
-        .fmgr-row-info  { display: flex; align-items: center; gap: 5px; flex: 1; overflow: hidden; min-width: 0; }
-        .fmgr-row-name  { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .fmgr-row-count { font-size: 11px; color: #999; flex-shrink: 0; }
-        .fmgr-row-btns  { display: flex; gap: 4px; flex-shrink: 0; margin-left: 8px; }
-        .fmgr-icon-btn  {
-            padding: 3px 8px; border-radius: 5px; border: 1px solid #ddd;
-            background: #fff; cursor: pointer; font-size: 11px; color: #444;
-        }
-        .fmgr-icon-btn:hover:not(:disabled) { background: #f0f0f0; }
-        .fmgr-icon-btn:disabled { opacity: .3; cursor: default; }
-        .fmgr-danger-txt { color: #dd2222 !important; }
-        .fmgr-btn {
-            padding: 7px 16px; border-radius: 7px; border: 1px solid #ccc;
-            background: #fff; cursor: pointer; font-size: 13px; color: #333;
-        }
-        .fmgr-btn:hover { background: #f5f5f5; }
-        .fmgr-btn-new   {
-            padding: 5px 12px; border-radius: 6px; border: none;
-            background: #007aff; color: #fff; font-size: 13px; cursor: pointer;
-        }
-        .fmgr-btn-new:hover { background: #005fd4; }
-
-        /* ── 설정 모달 ── */
-        #my-folder-settings-modal {
-            position: fixed; inset: 0; background: rgba(0,0,0,.5);
-            z-index: 10000; display: flex; justify-content: center; align-items: center;
-        }
-        .fset-box {
-            background: #fff; color: #333; border-radius: 12px; padding: 20px;
-            width: 480px; max-width: 92vw; max-height: 86vh;
-            display: flex; flex-direction: column; gap: 14px;
-            box-shadow: 0 8px 28px rgba(0,0,0,.35);
-        }
-        .fset-header { font-size: 17px; font-weight: bold; }
-        .fset-body   { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 13px; padding-right: 3px; }
-        .fset-footer { display: flex; gap: 8px; align-items: center; padding-top: 10px; border-top: 1px solid #eee; }
-        .fset-field  { display: flex; flex-direction: column; gap: 5px; }
-        .fset-label  { font-size: 12px; font-weight: 600; color: #555; }
-        .fset-label-sub { font-weight: normal; color: #999; }
-        .fset-input, .fset-select {
-            padding: 8px 10px; border: 1px solid #ddd; border-radius: 7px;
-            font-size: 13px; background: #fff; color: #333;
-            box-sizing: border-box; width: 100%;
-        }
-        .fset-session-list { border: 1px solid #ddd; border-radius: 7px; max-height: 210px; overflow-y: auto; padding: 3px; }
-        .fset-session-item {
-            display: flex; align-items: center; gap: 7px;
-            padding: 6px 8px; border-bottom: 1px solid #f2f2f2; font-size: 13px;
-        }
-        .fset-session-item:last-child { border-bottom: none; }
-        .fset-session-item label {
-            flex: 1; cursor: pointer;
-            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-            display: flex; align-items: center; gap: 5px;
-        }
-        .fset-session-item input[type="checkbox"] { cursor: pointer; flex-shrink: 0; }
-        .fset-badge-parent { font-size: 10px; background: rgba(0,122,255,.1); color: #007aff; border-radius: 3px; padding: 1px 5px; flex-shrink: 0; }
-        .fset-session-memo { font-size: 11px; color: #999; font-style: italic; }
-        .fset-empty { padding: 12px; color: #999; font-size: 12px; text-align: center; }
-        .fset-btn   { padding: 7px 16px; border-radius: 7px; border: 1px solid #ccc; background: #fff; cursor: pointer; font-size: 13px; color: #333; }
-        .fset-btn:hover          { background: #f5f5f5; }
-        .fset-btn-primary        { background: #007aff; color: #fff; border-color: #007aff; }
-        .fset-btn-primary:hover  { background: #005fd4; }
-        .fset-btn-danger         { background: #ff3b30; color: #fff; border-color: #ff3b30; }
-        .fset-btn-danger:hover   { background: #d42b21; }
-
-        /* ── 다크 모드 ── */
-        @media (prefers-color-scheme: dark) {
-            .fmgr-box, .fset-box      { background: #2c2c2c; color: #eee; }
-            .fmgr-row                 { background: rgba(255,255,255,.04); border-color: #444; }
-            .fmgr-icon-btn, .fmgr-btn { background: #3a3a3a; color: #ccc; border-color: #555; }
-            .fmgr-icon-btn:hover:not(:disabled), .fmgr-btn:hover { background: #484848; }
-            .fset-footer              { border-color: #444; }
-            .fset-input, .fset-select { background: #3a3a3a; color: #eee; border-color: #555; }
-            .fset-session-list        { border-color: #555; }
-            .fset-session-item        { border-color: #3d3d3d; }
-            .fset-btn                 { background: #3a3a3a; color: #eee; border-color: #555; }
-            .fset-btn:hover           { background: #484848; }
-        }
-        /* ── 이어하기 세션 선택 모달 ── */
-        #crack-session-picker-modal {
+        /* ── 이어하기 모달 ── */
+        #crack-picker-modal {
             position: fixed; inset: 0; background: rgba(0,0,0,.6);
             display: flex; align-items: center; justify-content: center;
             z-index: 99999;
         }
         .csp-box {
-            background: var(--surface_secondary, #1e1e1e);
-            color: var(--text_primary, #eee);
-            border-radius: 14px; padding: 0;
-            width: 440px; max-width: 93vw; max-height: 72vh;
+            background: var(--surface_secondary, #1e1e1e); color: var(--text_primary, #eee);
+            border-radius: 14px; width: 440px; max-width: 93vw; max-height: 72vh;
             display: flex; flex-direction: column;
             box-shadow: 0 16px 48px rgba(0,0,0,.7);
-            border: 1px solid rgba(255,255,255,.08);
-            overflow: hidden;
+            border: 1px solid rgba(255,255,255,.08); overflow: hidden;
         }
         .csp-header {
             display: flex; align-items: center; gap: 8px;
             padding: 16px 18px 14px;
             border-bottom: 1px solid rgba(255,255,255,.08);
-            font-size: 14px; font-weight: 700;
-            flex-shrink: 0;
+            font-size: 14px; font-weight: 700; flex-shrink: 0;
         }
-        .csp-icon  { font-size: 13px; color: #FF4432; flex-shrink: 0; }
+        .csp-icon { color: #FF4432; flex-shrink: 0; }
         .csp-title { flex: 1; }
-        .csp-count {
-            font-size: 11px; font-weight: normal;
-            opacity: .5; flex-shrink: 0;
-        }
-        .csp-list {
-            flex: 1; overflow-y: auto;
-            padding: 6px 0;
-        }
-        .csp-item {
+        .csp-count { font-size: 11px; font-weight: normal; opacity: .5; }
+        .csp-list  { flex: 1; overflow-y: auto; padding: 6px 0; }
+        .csp-item  {
             display: flex; flex-direction: column; gap: 3px;
-            padding: 11px 18px;
-            text-decoration: none; color: inherit;
-            cursor: pointer;
-            transition: background .12s;
-            border-bottom: 1px solid rgba(255,255,255,.04);
+            padding: 11px 18px; text-decoration: none; color: inherit; cursor: pointer;
+            transition: background .12s; border-bottom: 1px solid rgba(255,255,255,.04);
         }
         .csp-item:last-child { border-bottom: none; }
-        .csp-item:hover { background: rgba(150,150,150,.07); }
-        .csp-name {
-            font-size: 13px; font-weight: 500;
-            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        .csp-item:hover  { background: rgba(150,150,150,.07); }
+        .csp-name { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .csp-memo { font-size: 11px; color: var(--muted-foreground, #888); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .csp-footer { display: flex; justify-content: flex-end; padding: 12px 18px; border-top: 1px solid rgba(255,255,255,.08); flex-shrink: 0; }
+        .csp-btn { padding: 7px 18px; border-radius: 7px; border: 1px solid rgba(255,255,255,.15); background: rgba(255,255,255,.06); color: inherit; font-size: 13px; cursor: pointer; }
+        .csp-btn:hover { background: rgba(255,255,255,.12); }
+
+        /* ── 하위 보관함 관리 모달 ── */
+        #crack-sub-modal {
+            position: fixed; inset: 0; background: rgba(0,0,0,.55);
+            display: flex; align-items: center; justify-content: center;
+            z-index: 99999;
         }
-        .csp-memo {
-            font-size: 11px; color: var(--text_tertiary, #888);
-            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        .csub-box {
+            background: var(--surface_secondary, #1e1e1e);
+            color: var(--text_primary, #eee);
+            border-radius: 12px; width: 400px; max-width: 93vw; max-height: 80vh;
+            display: flex; flex-direction: column; gap: 0;
+            box-shadow: 0 12px 36px rgba(0,0,0,.7);
+            border: 1px solid rgba(255,255,255,.08); overflow: hidden;
         }
-        .csp-footer {
+        .csub-header {
+            padding: 14px 16px; font-size: 14px; font-weight: 700;
+            border-bottom: 1px solid rgba(255,255,255,.1); flex-shrink: 0;
+        }
+        .csub-section-title {
+            font-size: 11px; font-weight: 600; letter-spacing: .04em;
+            color: var(--muted-foreground, #888); text-transform: uppercase;
+            padding: 12px 16px 4px;
+        }
+        .csub-children {
+            padding: 0 12px 8px; display: flex; flex-direction: column; gap: 4px;
+        }
+        .csub-child-row {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 6px 8px; border-radius: 6px;
+            background: rgba(255,255,255,.05); font-size: 13px;
+        }
+        .csub-remove-btn {
+            background: none; border: none; cursor: pointer;
+            color: var(--muted-foreground, #888); font-size: 12px; padding: 2px 4px;
+            border-radius: 3px; transition: color .12s, background .12s;
+        }
+        .csub-remove-btn:hover { color: #ff6b6b; background: rgba(255,59,48,.12); }
+        .csub-empty { padding: 6px 8px; font-size: 12px; color: var(--muted-foreground, #888); }
+        .csub-assign-row {
+            display: flex; gap: 6px; align-items: center;
+            padding: 4px 12px 10px;
+        }
+        .csub-select, .csub-input {
+            flex: 1; padding: 6px 8px; border-radius: 6px;
+            border: 1px solid rgba(255,255,255,.15);
+            background: rgba(255,255,255,.07); color: inherit;
+            font-size: 13px; outline: none;
+        }
+        .csub-select:focus, .csub-input:focus { border-color: var(--primary, #FF4432); }
+        .csub-input::placeholder { color: rgba(255,255,255,.3); }
+        .csub-btn {
+            padding: 6px 12px; border-radius: 6px;
+            border: 1px solid rgba(255,255,255,.15);
+            background: rgba(255,255,255,.07); color: inherit;
+            font-size: 13px; cursor: pointer; white-space: nowrap;
+            transition: background .12s;
+        }
+        .csub-btn:hover { background: rgba(255,255,255,.14); }
+        .csub-btn-primary { background: var(--primary, #FF4432) !important; border-color: var(--primary, #FF4432) !important; color: #fff !important; }
+        .csub-btn-primary:hover { background: #e03a29 !important; }
+        .csub-hint {
+            font-size: 11px; color: var(--muted-foreground, #777);
+            padding: 0 16px 10px; line-height: 1.5;
+        }
+        .csub-footer {
             display: flex; justify-content: flex-end;
-            padding: 12px 18px;
-            border-top: 1px solid rgba(255,255,255,.08);
+            padding: 10px 16px; border-top: 1px solid rgba(255,255,255,.08);
             flex-shrink: 0;
         }
-        .csp-btn {
-            padding: 7px 18px; border-radius: 7px;
-            border: 1px solid rgba(255,255,255,.15);
-            background: rgba(255,255,255,.06); color: inherit;
-            font-size: 13px; cursor: pointer;
-            transition: background .15s;
-        }
-        .csp-btn:hover { background: rgba(255,255,255,.12); }
     `);
+
 })();
